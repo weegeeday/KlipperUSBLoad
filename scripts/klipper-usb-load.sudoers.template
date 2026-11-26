@@ -1,0 +1,2 @@
+# Passwordless root mount helper for KlipperUSBLoad (strictly validated inside helper)
+@USER@ ALL=(root) NOPASSWD: /usr/local/sbin/klipper-usb-load-helper

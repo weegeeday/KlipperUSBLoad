@@ -1,0 +1,18 @@
+# Add these sections to ~/printer_data/config/moonraker.conf
+
+[klipper_usb_load]
+# Optional defaults (all live settings can be edited via the Web Settings Page):
+# max_scan_depth: 2
+# wait_for_metadata: True
+# sync_timeout_seconds: 60.0
+# lcd_notifications: True
+# usb_subdir_name: usb
+
+[update_manager klipper_usb_load]
+type: git_repo
+channel: dev
+path: ~/KlipperUSBLoad
+origin: https://github.com/weegeeday/KlipperUSBLoad.git
+primary_branch: main
+managed_services: moonraker
+install_script: install.sh

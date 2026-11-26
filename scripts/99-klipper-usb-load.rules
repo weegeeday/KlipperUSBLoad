@@ -1,0 +1,7 @@
+# Udev rules for KlipperUSBLoad
+# Triggers Moonraker notification when a USB block storage partition or superfloppy is added/removed.
+
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/local/bin/klipper-usb-load-notify"
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="disk", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/local/bin/klipper-usb-load-notify"
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", RUN+="/usr/local/bin/klipper-usb-load-notify"
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="disk", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/local/bin/klipper-usb-load-notify"

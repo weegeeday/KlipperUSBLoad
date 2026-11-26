@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOUNT_BASE="/run/klipper-usb-load"
+TARGET_UID="${KLIPPER_USB_UID:-}"
+TARGET_GID="${KLIPPER_USB_GID:-}"
+
+fail() {
+  echo "klipper-usb-load-helper: $*" >&2
+  exit 1
+}
+
+validate_devnode() {
+  local dev="$1"
+  if [[ ! "$dev" =~ ^/dev/sd[a-z]+[0-9]*$ ]]; then
+    fail "Invalid device node: $dev"
+  fi
+  if [[ ! -b "$dev" ]]; then
+    fail "Block device does not exist: $dev"
+  fi
+}
+
+validate_mount_point() {
+  local mp="$1"
+  if [[ "$mp" == *".."* ]]; then
+    fail "Path traversal rejected in mount point: $mp"
+  fi
+  if [[ ! "$mp" =~ ^/run/klipper-usb-load/[A-Za-z0-9._-]+$ ]]; then
+    fail "Invalid mount point: $mp"
+  fi
+}
+
+resolve_uid_gid() {
+  if [[ -n "$TARGET_UID" && -n "$TARGET_GID" ]]; then
+    return 0
+  fi
+  if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
+    TARGET_UID="$SUDO_UID"
+    TARGET_GID="$SUDO_GID"
+    return 0
+  fi
+  TARGET_UID="$(id -u)"
+  TARGET_GID="$(id -g)"
+}
+
+cmd_mount() {
+  if [[ $# -ne 2 ]]; then
+    fail "Usage: mount <devnode> <mount_point>"
+  fi
+  local dev="$1"
+  local mp="$2"
+  validate_devnode "$dev"
+  validate_mount_point "$mp"
+
+  mkdir -p "$MOUNT_BASE"
+  mkdir -p "$mp"
+
+  if mountpoint -q "$mp"; then
+    umount -l "$mp" || true
+  fi
+
+  local fstype=""
+  if command -v blkid >/dev/null 2>&1; then
+    fstype="$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)"
+  fi
+
+  resolve_uid_gid
+  local opts="ro,nosuid,nodev,noexec"
+  case "$fstype" in
+    vfat|fat|exfat|msdos|ntfs|ntfs3)
+      opts="${opts},uid=${TARGET_UID},gid=${TARGET_GID},umask=0022"
+      ;;
+  esac
+
+  mount -o "$opts" "$dev" "$mp"
+}
+
+cmd_unmount() {
+  if [[ $# -lt 1 || $# -gt 2 ]]; then
+    fail "Usage: unmount <mount_point> [--force]"
+  fi
+  local mp="$1"
+  local force="${2:-}"
+  validate_mount_point "$mp"
+
+  if mountpoint -q "$mp"; then
+    if [[ "$force" == "--force" ]]; then
+      umount "$mp" 2>/dev/null || umount -l "$mp"
+    else
+      umount "$mp"
+    fi
+  fi
+
+  if [[ -d "$mp" ]]; then
+    rmdir "$mp" 2>/dev/null || true
+  fi
+}
+
+cmd_cleanup_all() {
+  if [[ ! -d "$MOUNT_BASE" ]]; then
+    return 0
+  fi
+  local entry
+  for entry in "$MOUNT_BASE"/*; do
+    [[ -d "$entry" ]] || continue
+    if mountpoint -q "$entry"; then
+      umount -l "$entry" || true
+    fi
+    rmdir "$entry" 2>/dev/null || true
+  done
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then
+    fail "Missing subcommand (mount|unmount|cleanup-all)"
+  fi
+  local action="$1"
+  shift
+  case "$action" in
+    mount)
+      cmd_mount "$@"
+      ;;
+    unmount)
+      cmd_unmount "$@"
+      ;;
+    cleanup-all)
+      cmd_cleanup_all
+      ;;
+    *)
+      fail "Unknown subcommand: $action"
+      ;;
+  esac
+}
+
+main "$@"

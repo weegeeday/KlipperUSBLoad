@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "klipper-usb-load"
+version = "0.1.0"
+description = "Moonraker/Klipper plugin for USB G-code auto-mounting, port filtering, and full-indexing readiness verification"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "jinja2>=3.1",
+  "mypy>=1.8",
+  "pytest>=8.0",
+  "ruff>=0.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["klipper_usb_load*"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unreachable = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

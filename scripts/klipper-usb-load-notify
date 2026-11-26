@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOONRAKER_URL="${KLIPPER_USB_LOAD_URL:-http://127.0.0.1:7125/server/klipper_usb_load/udev-event}"
+TOKEN_FILE="${KLIPPER_USB_LOAD_TOKEN_FILE:-/run/klipper-usb-load/udev.token}"
+
+extract_port_id() {
+  local devpath="${1:-}"
+  local found=""
+  local seg
+  IFS='/' read -r -a parts <<< "$devpath"
+  for seg in "${parts[@]}"; do
+    if [[ "$seg" == *:* ]]; then
+      continue
+    fi
+    if [[ "$seg" =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]]; then
+      found="$seg"
+    fi
+  done
+  printf '%s' "$found"
+}
+
+main() {
+  local action="${ACTION:-${1:-}}"
+  local devnode="${DEVNAME:-${2:-}}"
+  local devpath="${DEVPATH:-${3:-}}"
+  local fs_label="${ID_FS_LABEL:-}"
+  local fs_type="${ID_FS_TYPE:-}"
+
+  if [[ -z "$action" || -z "$devnode" ]]; then
+    exit 0
+  fi
+
+  local port_id
+  port_id="$(extract_port_id "$devpath")"
+  if [[ -z "$port_id" ]]; then
+    exit 0
+  fi
+
+  # Re-dispatch asynchronously when invoked directly from udev so udev never blocks
+  if [[ -z "${KLIPPER_USB_NOTIFY_DETACHED:-}" ]] && command -v systemd-run >/dev/null 2>&1; then
+    KLIPPER_USB_NOTIFY_DETACHED=1 \
+      systemd-run --no-block --quiet \
+      --setenv=ACTION="$action" \
+      --setenv=DEVNAME="$devnode" \
+      --setenv=DEVPATH="$devpath" \
+      --setenv=ID_FS_LABEL="$fs_label" \
+      --setenv=ID_FS_TYPE="$fs_type" \
+      --setenv=KLIPPER_USB_NOTIFY_DETACHED=1 \
+      --setenv=KLIPPER_USB_LOAD_URL="$MOONRAKER_URL" \
+      --setenv=KLIPPER_USB_LOAD_TOKEN_FILE="$TOKEN_FILE" \
+      "$0" >/dev/null 2>&1 || true
+    exit 0
+  fi
+
+  local token=""
+  if [[ -r "$TOKEN_FILE" ]]; then
+    token="$(tr -d '\r\n' < "$TOKEN_FILE")"
+  fi
+
+  local payload
+  if command -v python3 >/dev/null 2>&1; then
+    payload="$(python3 -c 'import json, sys; print(json.dumps({"action": sys.argv[1], "devnode": sys.argv[2], "port_id": sys.argv[3], "fs_label": sys.argv[4], "fs_type": sys.argv[5], "token": sys.argv[6]}))' \
+      "$action" "$devnode" "$port_id" "$fs_label" "$fs_type" "$token")"
+  else
+    payload="{\"action\":\"${action}\",\"devnode\":\"${devnode}\",\"port_id\":\"${port_id}\",\"token\":\"${token}\"}"
+  fi
+
+  curl -sS -m 5 -X POST \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    "$MOONRAKER_URL" >/dev/null 2>&1 || true
+}
+
+main "$@"
