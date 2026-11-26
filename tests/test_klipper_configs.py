@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import configparser
 import re
 from pathlib import Path
@@ -82,8 +83,43 @@ def test_core_klipper_cfg_sections_and_jinja_render() -> None:
     }
 
     set_out = _render_klipper_template(cfg.get("gcode_macro _USB_LOAD_SET_STATE", "gcode"), base_ctx)
-    assert 'VALUE="usb/port_1-1.2/benchy.gcode"' in set_out
+    assert """VALUE="'usb/port_1-1.2/benchy.gcode'" """.strip() in set_out
     assert "VALUE=1" in set_out
+
+    # Verify SET_GCODE_VARIABLE values pass Klipper's ast.literal_eval after outer-quote stripping
+    for sample_rel, sample_name in (
+        ("usb/port_1-1.1/2mm ID with treads x 16mm_PETG_9m17s.gcode", "2mm ID with treads x 16mm_PETG_9m17s.gcode"),
+        ("usb/port_1-1.1/John's part.gcode", "John's part.gcode"),
+    ):
+        sample_ctx = {
+            **base_ctx,
+            "params": {
+                "FILENAME": sample_rel,
+                "DISPLAY_NAME": sample_name,
+                "READY": 1,
+                "COUNT": 5,
+                "STATUS": f"Ready: {sample_name}",
+            },
+        }
+        rendered = _render_klipper_template(
+            cfg.get("gcode_macro _USB_LOAD_SET_STATE", "gcode"),
+            sample_ctx,
+        )
+        parsed_vars: dict[str, Any] = {}
+        for line in rendered.splitlines():
+            match = re.match(r"^\s*SET_GCODE_VARIABLE\s+MACRO=\S+\s+VARIABLE=(\S+)\s+VALUE=(.+)$", line)
+            if not match:
+                continue
+            var_name = match.group(1)
+            raw_val = match.group(2).strip()
+            if len(raw_val) >= 2 and raw_val.startswith('"') and raw_val.endswith('"'):
+                raw_val = raw_val[1:-1]
+            parsed_vars[var_name] = ast.literal_eval(raw_val)
+        assert parsed_vars["filename"] == sample_rel
+        assert parsed_vars["display_name"] == sample_name
+        assert parsed_vars["ready"] == 1
+        assert parsed_vars["count"] == 5
+        assert parsed_vars["status"] == f"Ready: {sample_name}"
 
     notify_out = _render_klipper_template(cfg.get("gcode_macro _USB_LOAD_NOTIFY", "gcode"), base_ctx)
     assert "M117 USB Ready: benchy.gcode" in notify_out
