@@ -60,15 +60,3 @@ jobs:
           fi
       - name: Run isolated install and uninstall dry-run test
         run: bash tests/test_install_dryrun.sh
-
-  frontend-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: Syntax check frontend ES modules
-        run: node --check web/state.js && node --check web/app.js && node --check web/mainsail-plugin.js
-      - name: Run frontend unit tests
-        run: node --test tests/test_frontend.mjs

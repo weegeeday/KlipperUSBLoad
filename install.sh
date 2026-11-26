@@ -7,8 +7,6 @@ MOONRAKER_PATH="${HOME}/moonraker"
 PRINTER_DATA_PATH="${HOME}/printer_data"
 SYSTEM_PREFIX=""
 NON_INTERACTIVE=0
-WITH_LCD=0
-WITH_NGINX=1
 
 usage() {
   cat <<EOF
@@ -16,9 +14,7 @@ Usage: ./install.sh [options]
 
 Options:
   --non-interactive       Do not prompt for confirmation
-  --with-lcd              Copy optional klipper_usb_load_lcd.cfg to printer_data/config
-  --with-nginx            Install Mainsail Nginx integration (enabled by default)
-  --no-nginx              Skip installing Mainsail Nginx integration
+  --with-lcd              Accepted for compatibility (LCD config is installed by default)
   --moonraker-path PATH   Path to Moonraker checkout (default: ~/moonraker)
   --printer-data PATH     Path to printer_data directory (default: ~/printer_data)
   --system-prefix PATH    Install system files under PATH instead of / (for testing)
@@ -34,15 +30,6 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --with-lcd)
-      WITH_LCD=1
-      shift
-      ;;
-    --with-nginx)
-      WITH_NGINX=1
-      shift
-      ;;
-    --no-nginx)
-      WITH_NGINX=0
       shift
       ;;
     --moonraker-path)
@@ -110,11 +97,9 @@ main() {
     fi
   fi
 
-  # 2. Copy Klipper configs
+  # 2. Copy Klipper configs (core macros + LCD menu)
   install -m 0644 "${SCRIPT_DIR}/config/klipper_usb_load.cfg" "${config_dir}/klipper_usb_load.cfg"
-  if [[ "$WITH_LCD" -eq 1 ]]; then
-    install -m 0644 "${SCRIPT_DIR}/config/klipper_usb_load_lcd.cfg" "${config_dir}/klipper_usb_load_lcd.cfg"
-  fi
+  install -m 0644 "${SCRIPT_DIR}/config/klipper_usb_load_lcd.cfg" "${config_dir}/klipper_usb_load_lcd.cfg"
 
   # 3. Install system mount helper, udev notifier, udev rule, tmpfiles, and sudoers
   local helper_dst="${SYSTEM_PREFIX}/usr/local/sbin/klipper-usb-load-helper"
@@ -122,6 +107,7 @@ main() {
   local udev_dst="${SYSTEM_PREFIX}/etc/udev/rules.d/99-klipper-usb-load.rules"
   local tmpfiles_dst="${SYSTEM_PREFIX}/etc/tmpfiles.d/klipper-usb-load.conf"
   local sudoers_dst="${SYSTEM_PREFIX}/etc/sudoers.d/klipper-usb-load"
+  local legacy_nginx="${SYSTEM_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
 
   install_file_priv 0755 "${SCRIPT_DIR}/scripts/klipper-usb-load-helper" "$helper_dst"
   install_file_priv 0755 "${SCRIPT_DIR}/scripts/klipper-usb-load-notify" "$notify_dst"
@@ -142,19 +128,11 @@ main() {
   install_file_priv 0440 "$tmp_sudoers" "$sudoers_dst"
   rm -f "$tmp_sudoers"
 
-  if [[ "$WITH_NGINX" -eq 1 ]]; then
-    local nginx_dst="${SYSTEM_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
-    if [[ -n "$SYSTEM_PREFIX" || -d /etc/nginx/conf.d ]]; then
-      install_file_priv 0644 "${SCRIPT_DIR}/config/nginx-klipper-usb-load.conf" "$nginx_dst"
-      if [[ -z "$SYSTEM_PREFIX" ]] && command -v nginx >/dev/null 2>&1; then
-        if run_priv nginx -t >/dev/null 2>&1; then
-          run_priv systemctl reload nginx || true
-        else
-          echo "Warning: nginx rejected sub_filter config (missing ngx_http_sub_module?); removing snippet." >&2
-          run_priv rm -f "$nginx_dst" || true
-        fi
-      fi
-    fi
+  # Remove any legacy nginx WebUI snippet from earlier versions
+  local removed_legacy_nginx=0
+  if [[ -e "$legacy_nginx" ]]; then
+    run_priv rm -f "$legacy_nginx"
+    removed_legacy_nginx=1
   fi
 
   if [[ -z "$SYSTEM_PREFIX" ]]; then
@@ -163,6 +141,9 @@ main() {
     else
       run_priv mkdir -p /run/klipper-usb-load
       run_priv chown "${TARGET_USER}:${TARGET_USER}" /run/klipper-usb-load || true
+    fi
+    if [[ "$removed_legacy_nginx" -eq 1 ]] && command -v systemctl >/dev/null 2>&1; then
+      run_priv systemctl reload nginx || true
     fi
     if command -v udevadm >/dev/null 2>&1; then
       run_priv udevadm control --reload-rules || true
@@ -174,13 +155,11 @@ main() {
 
   echo "KlipperUSBLoad installed successfully."
   echo "Next steps:"
-  echo "  1. Add [include klipper_usb_load.cfg] to ${config_dir}/printer.cfg"
-  if [[ "$WITH_LCD" -eq 1 ]]; then
-    echo "     and [include klipper_usb_load_lcd.cfg] if you have a [display] section"
-  fi
-  echo "  2. Add [klipper_usb_load] to ${config_dir}/moonraker.conf"
-  echo "  3. Refresh Mainsail to see the USB G-Code Dashboard panel & USB Load sidebar tab"
-  echo "     (Standalone UI also available at http://<printer-ip>:7125/server/klipper_usb_load/ui/)"
+  echo "  1. Add to ${config_dir}/printer.cfg:"
+  echo "       [include klipper_usb_load.cfg]"
+  echo "       [include klipper_usb_load_lcd.cfg]"
+  echo "  2. Add [klipper_usb_load] to ${config_dir}/moonraker.conf (see config/moonraker.conf.example)"
+  echo "  3. Restart Klipper and Moonraker."
 }
 
 main

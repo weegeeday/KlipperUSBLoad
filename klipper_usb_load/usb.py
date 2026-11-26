@@ -1,4 +1,4 @@
-"""USB drive mounting, G-code scanning, and symlink materialization."""
+"""Sysfs USB storage discovery, read-only mounting, scanning, and symlink management."""
 
 from __future__ import annotations
 
@@ -6,14 +6,15 @@ import asyncio
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional, Protocol, Sequence
 
-from .models import ScannedGcodeFile
-from .usb_topology import sanitize_port_id
-
 _DEVNODE_RE = re.compile(r"^/dev/sd[a-z]+[0-9]*$")
 _PORT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+_USB_PORT_SEGMENT_RE = re.compile(r"^(\d+)-(\d+(?:\.\d+)*)$")
+_BLOCK_DEV_RE = re.compile(r"^(sd[a-z]+)([0-9]*)$")
+_SAFE_PORT_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 _IGNORED_NAMES = {
     "system volume information",
@@ -23,7 +24,27 @@ _IGNORED_NAMES = {
 
 
 class MountError(RuntimeError):
-    """Raised when mounting, unmounting, or validating a USB drive fails."""
+    """Raised when mounting, unmounting, or validating a USB storage device fails."""
+
+
+@dataclass(frozen=True)
+class ConnectedUsbStorage:
+    """Represents a connected USB block storage device mapped to a physical USB port."""
+
+    port_id: str
+    devnode: str
+
+
+@dataclass(frozen=True)
+class ScannedGcodeFile:
+    """Represents a valid G-code file discovered on a mounted USB drive."""
+
+    rel_path: str
+    usb_abs_path: str
+    display_name: str
+    drive_port_id: str
+    mtime: float
+    size: int
 
 
 class MountCommandRunner(Protocol):
@@ -74,7 +95,7 @@ class SubprocessMountRunner:
 
 
 def validate_devnode(devnode: str) -> str:
-    """Validate that devnode is a safe /dev/sd* path."""
+    """Validate that devnode is a safe /dev/sd* block path."""
     cleaned = devnode.strip()
     if not _DEVNODE_RE.match(cleaned):
         raise MountError(f"Unsupported or unsafe device node: {devnode!r}")
@@ -91,12 +112,94 @@ def validate_port_id(port_id: str) -> str:
     return cleaned
 
 
+def sanitize_port_id(port_id: str) -> str:
+    """Convert a physical USB port ID (e.g. '1-1.3') into a safe folder/mount name."""
+    cleaned = _SAFE_PORT_CHARS_RE.sub("_", port_id.strip())
+    if not cleaned or cleaned in (".", ".."):
+        raise MountError(f"Cannot sanitize invalid port_id: {port_id!r}")
+    return cleaned
+
+
+def extract_port_id_from_sysfs_path(path_text: str) -> Optional[str]:
+    """Extract the deepest USB port ID segment (e.g. '1-1.3') from a sysfs path."""
+    parts = [segment for segment in path_text.replace("\\", "/").split("/") if segment]
+    found: Optional[str] = None
+    for segment in parts:
+        if ":" in segment:
+            continue
+        if _USB_PORT_SEGMENT_RE.match(segment):
+            found = segment
+    return found
+
+
+def _resolve_block_port(block_entry: Path) -> Optional[str]:
+    candidates: list[str] = []
+    marker = block_entry / "device_path"
+    if marker.is_file():
+        try:
+            candidates.append(marker.read_text(encoding="utf-8", errors="replace").strip())
+        except OSError:
+            pass
+    if block_entry.is_symlink():
+        try:
+            candidates.append(os.readlink(block_entry))
+        except OSError:
+            pass
+    try:
+        candidates.append(str(block_entry.resolve()))
+    except OSError:
+        pass
+    device_link = block_entry / "device"
+    if device_link.exists() or device_link.is_symlink():
+        try:
+            candidates.append(str(device_link.resolve()))
+        except OSError:
+            pass
+
+    for path_text in candidates:
+        port_id = extract_port_id_from_sysfs_path(path_text)
+        if port_id:
+            return port_id
+    return None
+
+
+def scan_connected_storage_ports(sysfs_root: Path = Path("/sys")) -> list[ConnectedUsbStorage]:
+    """Return connected USB block storage devices mapped to their physical USB port ID."""
+    block_dir = Path(sysfs_root) / "class" / "block"
+    if not block_dir.is_dir():
+        return []
+
+    per_port: dict[str, list[tuple[str, bool]]] = {}
+    try:
+        entries = sorted(block_dir.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+
+    for entry in entries:
+        match = _BLOCK_DEV_RE.match(entry.name)
+        if not match:
+            continue
+        is_partition = bool(match.group(2))
+        port_id = _resolve_block_port(entry)
+        if not port_id:
+            continue
+        per_port.setdefault(port_id, []).append((f"/dev/{entry.name}", is_partition))
+
+    discovered: list[ConnectedUsbStorage] = []
+    for port_id in sorted(per_port.keys()):
+        candidates = per_port[port_id]
+        partitions = [dev for dev, is_part in candidates if is_part]
+        devnode = sorted(partitions)[0] if partitions else sorted(d for d, _ in candidates)[0]
+        discovered.append(ConnectedUsbStorage(port_id=port_id, devnode=devnode))
+    return discovered
+
+
 def _should_ignore_name(name: str) -> bool:
     return name.startswith(".") or name.lower() in _IGNORED_NAMES
 
 
-class MountManager:
-    """Coordinates read-only mounts, G-code discovery, and per-port symlink folders."""
+class UsbMountManager:
+    """Coordinates read-only mounts, G-code scanning, and per-port symlink folders."""
 
     def __init__(
         self,
@@ -111,10 +214,6 @@ class MountManager:
         self.usb_subdir_name = usb_subdir_name
         self.runner: MountCommandRunner = runner if runner is not None else SubprocessMountRunner()
         self._link_fn: Callable[[str, str], None] = link_fn if link_fn is not None else os.symlink
-
-    def set_usb_subdir_name(self, name: str) -> None:
-        """Update the root subfolder under gcodes/ used for USB symlinks."""
-        self.usb_subdir_name = name
 
     @property
     def usb_root_dir(self) -> Path:
@@ -221,9 +320,7 @@ class MountManager:
                         walk_dir(entry, rel_parts + (name,), depth + 1)
                     continue
 
-                if not entry.is_file():
-                    continue
-                if entry.suffix.lower() not in allowed_exts:
+                if not entry.is_file() or entry.suffix.lower() not in allowed_exts:
                     continue
 
                 try:

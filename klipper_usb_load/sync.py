@@ -3,14 +3,40 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Literal, Optional, Protocol, Sequence
 
-from .models import ScannedGcodeFile, SyncProgress
+from .usb import ScannedGcodeFile
+
+SyncState = Literal["idle", "syncing", "ready", "warning"]
+
+
+@dataclass
+class SyncProgress:
+    """Tracks Moonraker indexing progress for a mounted USB drive."""
+
+    state: SyncState = "idle"
+    total_files: int = 0
+    seen_files: int = 0
+    metadata_ready_files: int = 0
+    missing_files: list[str] = field(default_factory=list)
+    message: str = ""
+    warning: str = ""
+
+
+@dataclass
+class SyncResult:
+    """Outcome of waiting for Moonraker to load all USB G-code files."""
+
+    progress: SyncProgress
+    seen_paths: set[str]
+    ready_paths: set[str]
+    cancelled: bool = False
+    timed_out: bool = False
 
 
 class MoonrakerFileBackend(Protocol):
-    """Abstract interface over Moonraker's file_manager for testability."""
+    """Abstract interface over Moonraker's file_manager."""
 
     async def refresh_directory(self, rel_dir: str) -> None:
         """Ask Moonraker to scan/refresh a relative directory inside gcodes/."""
@@ -23,17 +49,6 @@ class MoonrakerFileBackend(Protocol):
 
     async def request_metadata_parse(self, rel_path: str) -> None:
         """Nudge Moonraker to parse metadata for rel_path if supported."""
-
-
-@dataclass
-class SyncResult:
-    """Final outcome of waiting for Moonraker to load all USB G-code files."""
-
-    progress: SyncProgress
-    seen_paths: set[str]
-    ready_paths: set[str]
-    cancelled: bool = False
-    timed_out: bool = False
 
 
 ProgressCallback = Callable[[SyncProgress], Awaitable[None]]
@@ -85,7 +100,7 @@ class GcodeSyncEngine:
                 seen_files=0,
                 metadata_ready_files=0,
                 missing_files=[],
-                message="USB mounted (no G-code files found)",
+                message="USB mounted (0 G-code files)",
             )
             if on_progress is not None:
                 await on_progress(progress)
@@ -135,7 +150,6 @@ class GcodeSyncEngine:
                 ready_paths = set(seen_paths)
 
             missing_files = [path for path in expected_paths if path not in ready_paths]
-
             if not missing_files:
                 done_progress = SyncProgress(
                     state="ready",
@@ -155,7 +169,7 @@ class GcodeSyncEngine:
 
             now = loop.time()
             if now >= deadline:
-                available_for_print = ready_paths if ready_paths else seen_paths
+                available = ready_paths if ready_paths else seen_paths
                 warning_msg = (
                     f"Timed out waiting for {len(missing_files)}/{total} USB G-code file(s) "
                     "to finish indexing in Moonraker"
@@ -166,7 +180,7 @@ class GcodeSyncEngine:
                     seen_files=len(seen_paths),
                     metadata_ready_files=len(ready_paths),
                     missing_files=missing_files,
-                    message=f"USB partial ({len(available_for_print)}/{total} ready)",
+                    message=f"USB partial ({len(available)}/{total} ready)",
                     warning=warning_msg,
                 )
                 if on_progress is not None:
@@ -174,7 +188,7 @@ class GcodeSyncEngine:
                 return SyncResult(
                     progress=timeout_progress,
                     seen_paths=seen_paths,
-                    ready_paths=available_for_print,
+                    ready_paths=available,
                     timed_out=True,
                 )
 

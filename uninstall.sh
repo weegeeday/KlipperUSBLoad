@@ -67,7 +67,7 @@ main() {
   local udev_dst="${SYSTEM_PREFIX}/etc/udev/rules.d/99-klipper-usb-load.rules"
   local tmpfiles_dst="${SYSTEM_PREFIX}/etc/tmpfiles.d/klipper-usb-load.conf"
   local sudoers_dst="${SYSTEM_PREFIX}/etc/sudoers.d/klipper-usb-load"
-  local nginx_dst="${SYSTEM_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
+  local legacy_nginx="${SYSTEM_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
 
   if [[ -z "$SYSTEM_PREFIX" && -x "$helper_dst" ]]; then
     run_priv "$helper_dst" cleanup-all || true
@@ -76,14 +76,19 @@ main() {
   rm -f "${MOONRAKER_PATH}/moonraker/components/klipper_usb_load.py"
   rm -rf "${PRINTER_DATA_PATH}/gcodes/usb"
 
-  run_priv rm -f "$helper_dst" "$notify_dst" "$udev_dst" "$tmpfiles_dst" "$sudoers_dst" "$nginx_dst"
+  local removed_legacy_nginx=0
+  if [[ -e "$legacy_nginx" ]]; then
+    removed_legacy_nginx=1
+  fi
+
+  run_priv rm -f "$helper_dst" "$notify_dst" "$udev_dst" "$tmpfiles_dst" "$sudoers_dst" "$legacy_nginx"
 
   if [[ -z "$SYSTEM_PREFIX" ]]; then
+    if [[ "$removed_legacy_nginx" -eq 1 ]] && command -v systemctl >/dev/null 2>&1; then
+      run_priv systemctl reload nginx || true
+    fi
     if command -v udevadm >/dev/null 2>&1; then
       run_priv udevadm control --reload-rules || true
-    fi
-    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files nginx.service >/dev/null 2>&1; then
-      run_priv systemctl reload nginx || true
     fi
     if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files moonraker.service >/dev/null 2>&1; then
       run_priv systemctl restart moonraker || true

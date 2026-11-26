@@ -9,11 +9,18 @@ MOONRAKER_DIR="${TMP_DIR}/moonraker"
 PRINTER_DATA_DIR="${TMP_DIR}/printer_data"
 SYS_PREFIX="${TMP_DIR}/sys_prefix"
 
-mkdir -p "${MOONRAKER_DIR}/.git/info" "${MOONRAKER_DIR}/moonraker/components" "${PRINTER_DATA_DIR}/config" "${PRINTER_DATA_DIR}/gcodes"
+mkdir -p \
+  "${MOONRAKER_DIR}/.git/info" \
+  "${MOONRAKER_DIR}/moonraker/components" \
+  "${PRINTER_DATA_DIR}/config" \
+  "${PRINTER_DATA_DIR}/gcodes" \
+  "${SYS_PREFIX}/etc/nginx/conf.d"
+
+# Simulate a legacy nginx snippet from an earlier version to verify cleanup
+touch "${SYS_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
 
 "${REPO_ROOT}/install.sh" \
   --non-interactive \
-  --with-lcd \
   --moonraker-path "$MOONRAKER_DIR" \
   --printer-data "$PRINTER_DATA_DIR" \
   --system-prefix "$SYS_PREFIX" \
@@ -28,8 +35,7 @@ test -x "${SYS_PREFIX}/usr/local/bin/klipper-usb-load-notify"
 test -f "${SYS_PREFIX}/etc/udev/rules.d/99-klipper-usb-load.rules"
 test -f "${SYS_PREFIX}/etc/tmpfiles.d/klipper-usb-load.conf"
 test -f "${SYS_PREFIX}/etc/sudoers.d/klipper-usb-load"
-test -f "${SYS_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
-grep -q "mainsail-plugin.js" "${SYS_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
+test ! -e "${SYS_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
 grep -q "pi ALL=(root) NOPASSWD:" "${SYS_PREFIX}/etc/sudoers.d/klipper-usb-load"
 grep -q "d /run/klipper-usb-load 0755 pi pi -" "${SYS_PREFIX}/etc/tmpfiles.d/klipper-usb-load.conf"
 
@@ -55,7 +61,6 @@ test ! -e "${SYS_PREFIX}/usr/local/bin/klipper-usb-load-notify"
 test ! -e "${SYS_PREFIX}/etc/udev/rules.d/99-klipper-usb-load.rules"
 test ! -e "${SYS_PREFIX}/etc/tmpfiles.d/klipper-usb-load.conf"
 test ! -e "${SYS_PREFIX}/etc/sudoers.d/klipper-usb-load"
-test ! -e "${SYS_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
 test -f "${PRINTER_DATA_DIR}/config/klipper_usb_load.cfg"
 
 echo "install/uninstall dry-run passed!"

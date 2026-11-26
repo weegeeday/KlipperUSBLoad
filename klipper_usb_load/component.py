@@ -1,35 +1,41 @@
-"""Main Moonraker component for KlipperUSBLoad."""
+"""Moonraker component for KlipperUSBLoad (INI-configured, LCD-only)."""
 
 from __future__ import annotations
 
 import asyncio
 import hmac
+import inspect
 import logging
+import re
 import secrets
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .config_store import SettingsStore, SettingsValidationError
-from .models import (
-    ActivePrintInfo,
-    DetectModeState,
-    MountedDriveState,
+from .config import UsbLoadConfig
+from .sync import GcodeSyncEngine, SyncProgress, select_newest_file
+from .usb import (
+    MountError,
     ScannedGcodeFile,
-    SyncProgress,
+    UsbMountManager,
+    scan_connected_storage_ports,
+    validate_devnode,
+    validate_port_id,
 )
-from .moonraker_adapter import MoonrakerAdapter
-from .mount_manager import MountError, MountManager, validate_devnode, validate_port_id
-from .sync_engine import GcodeSyncEngine, select_newest_file
-from .usb_topology import UsbTopologyScanner
 
 LOGGER = logging.getLogger("moonraker.klipper_usb_load")
 
-WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+_GCODE_CTRL_RE = re.compile(r"[\r\n\x00]+")
+
+
+def sanitize_gcode_string(value: str, max_len: int = 180) -> str:
+    """Strip control chars and double quotes so values are safe inside G-code strings."""
+    cleaned = _GCODE_CTRL_RE.sub(" ", value).replace('"', "'").strip()
+    return cleaned[:max_len]
 
 
 def _resolve_request_types(methods: list[str]) -> Any:
-    """Resolve Moonraker RequestType enum if running inside Moonraker, else list[str]."""
     try:
         from moonraker.common import RequestType  # type: ignore[import-not-found]
     except ImportError:
@@ -44,125 +50,315 @@ def _resolve_request_types(methods: list[str]) -> Any:
     return resolved
 
 
-def _read_config_value(config: Any, key: str, default: Any = None) -> Any:
-    if config is None:
-        return default
-    if isinstance(config, dict):
-        return config.get(key, default)
-    getter = getattr(config, "get", None)
-    if callable(getter):
+@dataclass
+class MountedDrive:
+    """Runtime state for an actively mounted USB drive."""
+
+    port_id: str
+    devnode: str
+    gcode_subdir: str
+    files: list[ScannedGcodeFile] = field(default_factory=list)
+    ready_paths: set[str] = field(default_factory=set)
+
+
+class MoonrakerBridge:
+    """Adapts Moonraker's file_manager and klippy_apis for KlipperUSBLoad."""
+
+    def __init__(self, server: Any) -> None:
+        self.server = server
+        self._macros_checked: bool = False
+        self._has_set_state_macro: bool = True
+        self._has_notify_macro: bool = True
+        self._warned_missing_macros: bool = False
+
+    def _get_component(self, name: str) -> Any:
         try:
-            return getter(key, default)
+            return self.server.lookup_component(name, None)
         except TypeError:
-            return default
-    return default
+            try:
+                return self.server.lookup_component(name)
+            except Exception:
+                return None
+        except Exception:
+            return None
 
+    def reset_macro_cache(self) -> None:
+        """Clear cached Klipper macro presence flags when Klippy reconnects."""
+        self._macros_checked = False
+        self._warned_missing_macros = False
 
-def _read_config_float(config: Any, key: str, default: float) -> float:
-    if config is None:
-        return default
-    if isinstance(config, dict):
-        return float(config.get(key, default))
-    getter = getattr(config, "getfloat", None)
-    if callable(getter):
-        return float(getter(key, default))
-    return float(_read_config_value(config, key, default))
+    async def refresh_directory(self, rel_dir: str) -> None:
+        """Ask Moonraker file_manager to rescan rel_dir inside gcodes/."""
+        file_manager = self._get_component("file_manager")
+        if file_manager is None:
+            return
 
+        for method_name in ("refresh_directory", "sync_dir", "schedule_sync_dir"):
+            method = getattr(file_manager, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method("gcodes", rel_dir)
+                if inspect.isawaitable(result):
+                    await result
+                return
+            except TypeError:
+                try:
+                    result = method(f"gcodes/{rel_dir}")
+                    if inspect.isawaitable(result):
+                        await result
+                    return
+                except Exception:
+                    continue
+            except Exception as err:
+                LOGGER.debug("Moonraker %s(%s) raised: %s", method_name, rel_dir, err)
 
-def _read_config_int(config: Any, key: str, default: int) -> int:
-    if config is None:
-        return default
-    if isinstance(config, dict):
-        return int(config.get(key, default))
-    getter = getattr(config, "getint", None)
-    if callable(getter):
-        return int(getter(key, default))
-    return int(_read_config_value(config, key, default))
+    async def list_gcode_files(self) -> dict[str, dict[str, Any]]:
+        """Return Moonraker's current gcodes file mapping (rel_path -> info dict)."""
+        file_manager = self._get_component("file_manager")
+        if file_manager is None:
+            return {}
 
+        get_file_list = getattr(file_manager, "get_file_list", None)
+        if not callable(get_file_list):
+            return {}
 
-def _read_config_bool(config: Any, key: str, default: bool) -> bool:
-    if config is None:
-        return default
-    if isinstance(config, dict):
-        return bool(config.get(key, default))
-    getter = getattr(config, "getboolean", None)
-    if callable(getter):
-        return bool(getter(key, default))
-    return bool(_read_config_value(config, key, default))
+        try:
+            raw = get_file_list("gcodes")
+            if inspect.isawaitable(raw):
+                raw = await raw
+        except TypeError:
+            raw = get_file_list("gcodes", list_format=False)
+            if inspect.isawaitable(raw):
+                raw = await raw
+        except Exception as err:
+            LOGGER.debug("file_manager.get_file_list failed: %s", err)
+            return {}
+
+        if isinstance(raw, dict):
+            return {str(k): (v if isinstance(v, dict) else {}) for k, v in raw.items()}
+        if isinstance(raw, list):
+            return {
+                str(item["path"]): item
+                for item in raw
+                if isinstance(item, dict) and "path" in item
+            }
+        return {}
+
+    async def is_metadata_ready(self, rel_path: str) -> bool:
+        """Return True if Moonraker has metadata stored in memory for rel_path."""
+        file_manager = self._get_component("file_manager")
+        if file_manager is None:
+            return False
+
+        gcode_metadata = getattr(file_manager, "gcode_metadata", None)
+        if gcode_metadata is not None:
+            for attr in ("get", "get_metadata"):
+                getter = getattr(gcode_metadata, attr, None)
+                if not callable(getter):
+                    continue
+                try:
+                    meta = getter(rel_path)
+                    if inspect.isawaitable(meta):
+                        meta = await meta
+                    if isinstance(meta, dict) and bool(meta):
+                        return True
+                except Exception:
+                    continue
+
+        get_meta = getattr(file_manager, "get_file_metadata", None)
+        if callable(get_meta):
+            try:
+                meta = get_meta(rel_path)
+                if inspect.isawaitable(meta):
+                    meta = await meta
+                if isinstance(meta, dict) and (
+                    "slicer" in meta
+                    or "estimated_time" in meta
+                    or "metadata_pulled" in meta
+                    or "size" in meta
+                ):
+                    return True
+            except Exception:
+                pass
+
+        return False
+
+    async def request_metadata_parse(self, rel_path: str) -> None:
+        """Trigger Moonraker metadata parsing for rel_path if exposed."""
+        file_manager = self._get_component("file_manager")
+        if file_manager is None:
+            return
+        gcode_metadata = getattr(file_manager, "gcode_metadata", None)
+        if gcode_metadata is None:
+            return
+
+        for method_name in ("parse_metadata", "add_file"):
+            method = getattr(gcode_metadata, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method(rel_path, {})
+                if inspect.isawaitable(result):
+                    await result
+                return
+            except TypeError:
+                try:
+                    result = method(rel_path)
+                    if inspect.isawaitable(result):
+                        await result
+                    return
+                except Exception:
+                    continue
+            except Exception:
+                return
+
+    async def check_macros_installed(self) -> bool:
+        """Verify whether _USB_LOAD_SET_STATE and _USB_LOAD_NOTIFY exist in Klipper."""
+        if self._macros_checked:
+            return self._has_set_state_macro
+
+        klippy_apis = self._get_component("klippy_apis")
+        if klippy_apis is None:
+            return self._has_set_state_macro
+
+        get_object_list = getattr(klippy_apis, "get_object_list", None)
+        if not callable(get_object_list):
+            self._macros_checked = True
+            self._has_set_state_macro = True
+            self._has_notify_macro = True
+            return True
+
+        try:
+            objects = get_object_list()
+            if inspect.isawaitable(objects):
+                objects = await objects
+            if isinstance(objects, (list, tuple, set)):
+                obj_set = {str(o) for o in objects}
+                self._has_set_state_macro = "gcode_macro _USB_LOAD_SET_STATE" in obj_set
+                self._has_notify_macro = "gcode_macro _USB_LOAD_NOTIFY" in obj_set
+                self._macros_checked = True
+                if not self._has_set_state_macro and not self._warned_missing_macros:
+                    self._warned_missing_macros = True
+                    LOGGER.warning(
+                        "Klipper macros not loaded in printer.cfg. Add "
+                        "[include klipper_usb_load.cfg] and restart Klipper."
+                    )
+        except Exception as err:
+            LOGGER.debug("get_object_list() unavailable: %s", err)
+
+        return self._has_set_state_macro
+
+    async def get_active_print_filename(self) -> Optional[str]:
+        """Return the filename being printed/paused in Klipper, or None if idle."""
+        klippy_apis = self._get_component("klippy_apis")
+        if klippy_apis is None:
+            return None
+        query_objects = getattr(klippy_apis, "query_objects", None)
+        if not callable(query_objects):
+            return None
+
+        try:
+            result = query_objects({"print_stats": ["state", "filename"]})
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, dict):
+                stats = result.get("print_stats", {})
+                if isinstance(stats, dict):
+                    state = str(stats.get("state", "standby")).lower()
+                    filename = str(stats.get("filename", ""))
+                    if state in ("printing", "paused") and filename:
+                        return filename
+        except Exception as err:
+            LOGGER.debug("Could not query Klipper print_stats: %s", err)
+        return None
+
+    async def run_gcode(self, script: str) -> None:
+        """Execute a G-code script on Klipper via klippy_apis."""
+        klippy_apis = self._get_component("klippy_apis")
+        if klippy_apis is None:
+            return
+        run_gcode = getattr(klippy_apis, "run_gcode", None)
+        if not callable(run_gcode):
+            return
+        try:
+            result = run_gcode(script)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as err:
+            LOGGER.debug("run_gcode(%s) failed: %s", script, err)
+
+    async def publish_state(
+        self,
+        *,
+        newest_file: Optional[ScannedGcodeFile],
+        total_count: int,
+        status_text: str,
+        notify_msg: Optional[str] = None,
+        lcd_notifications: bool = True,
+        update_macro_state: bool = True,
+    ) -> None:
+        """Update Klipper _USB_LOAD_STATE variables and optionally display M117 on LCD."""
+        await self.check_macros_installed()
+
+        if update_macro_state and self._has_set_state_macro:
+            if newest_file is not None:
+                filename = sanitize_gcode_string(newest_file.rel_path, max_len=240)
+                display_name = sanitize_gcode_string(newest_file.display_name, max_len=64)
+                ready = 1
+            else:
+                filename = ""
+                display_name = ""
+                ready = 0
+            safe_status = sanitize_gcode_string(status_text, max_len=64)
+            await self.run_gcode(
+                f'_USB_LOAD_SET_STATE FILENAME="{filename}" DISPLAY_NAME="{display_name}" '
+                f'READY={ready} COUNT={int(total_count)} STATUS="{safe_status}"'
+            )
+
+        if lcd_notifications and notify_msg:
+            safe_msg = sanitize_gcode_string(notify_msg, max_len=80)
+            if safe_msg:
+                if self._has_notify_macro:
+                    await self.run_gcode(f'_USB_LOAD_NOTIFY MSG="{safe_msg}"')
+                else:
+                    await self.run_gcode(f"M117 {safe_msg}")
 
 
 class KlipperUsbLoad:
-    """Moonraker plugin orchestrating USB port filtering, mounting, and G-code sync."""
+    """Moonraker plugin orchestrating USB mounting, full indexing wait, and LCD state."""
 
     def __init__(
         self,
         config: Any,
         *,
-        settings_store: Optional[SettingsStore] = None,
-        topology_scanner: Optional[UsbTopologyScanner] = None,
-        mount_manager: Optional[MountManager] = None,
-        adapter: Optional[MoonrakerAdapter] = None,
-        token_path: Optional[Path] = None,
+        mount_manager: Optional[UsbMountManager] = None,
+        bridge: Optional[MoonrakerBridge] = None,
     ) -> None:
         self.server = config.get_server() if hasattr(config, "get_server") else config["server"]
-        data_path = self._resolve_data_path()
-        self._data_path = data_path
+        self.cfg = UsbLoadConfig.from_moonraker_config(config)
+        self._data_path = self._resolve_data_path()
 
-        default_settings_path = data_path / "config" / "klipper_usb_load.json"
-        settings_path_str = _read_config_value(config, "settings_path", None)
-        settings_path = Path(settings_path_str) if settings_path_str else default_settings_path
-
-        defaults = {
-            "max_scan_depth": _read_config_int(config, "max_scan_depth", 2),
-            "wait_for_metadata": _read_config_bool(config, "wait_for_metadata", True),
-            "sync_timeout_seconds": _read_config_float(config, "sync_timeout_seconds", 60.0),
-            "lcd_notifications": _read_config_bool(config, "lcd_notifications", True),
-            "usb_subdir_name": str(_read_config_value(config, "usb_subdir_name", "usb")),
-        }
-
-        self.settings_store = settings_store or SettingsStore(settings_path, defaults=defaults)
-        self.settings_store.load()
-
-        sysfs_root_str = _read_config_value(config, "sysfs_root", "/sys")
-        self.topology = topology_scanner or UsbTopologyScanner(Path(str(sysfs_root_str)))
-
-        gcodes_dir_str = _read_config_value(config, "gcodes_path", None)
-        gcodes_dir = Path(str(gcodes_dir_str)) if gcodes_dir_str else (data_path / "gcodes")
-        mount_base_str = _read_config_value(config, "mount_base", "/run/klipper-usb-load")
-
-        self.mount_manager = mount_manager or MountManager(
+        gcodes_dir = self.cfg.gcodes_path or (self._data_path / "gcodes")
+        self.mount_manager = mount_manager or UsbMountManager(
             gcodes_dir=gcodes_dir,
-            mount_base=Path(str(mount_base_str)),
-            usb_subdir_name=self.settings_store.settings.usb_subdir_name,
+            mount_base=self.cfg.mount_base,
+            usb_subdir_name=self.cfg.usb_subdir_name,
         )
-        self.adapter = adapter or MoonrakerAdapter(self.server)
-        self.sync_engine = GcodeSyncEngine(self.adapter)
+        self.bridge = bridge or MoonrakerBridge(self.server)
+        self.sync_engine = GcodeSyncEngine(self.bridge)
 
-        token_cfg = _read_config_value(config, "udev_token_path", None)
-        self.token_path = (
-            token_path
-            if token_path is not None
-            else (
-                Path(str(token_cfg))
-                if token_cfg
-                else (self.mount_manager.mount_base / "udev.token")
-            )
-        )
+        self.token_path = self.cfg.udev_token_path or (self.mount_manager.mount_base / "udev.token")
         self._udev_token: str = ""
 
-        self._mounted_drives: dict[str, MountedDriveState] = {}
-        self._ready_paths_by_port: dict[str, set[str]] = {}
+        self._mounted_drives: dict[str, MountedDrive] = {}
         self._port_locks: dict[str, asyncio.Lock] = {}
         self._port_cancel_events: dict[str, asyncio.Event] = {}
         self._port_generations: dict[str, int] = {}
         self._newest_file: Optional[ScannedGcodeFile] = None
-        self._last_warning: str = ""
-        self._detect_mode = DetectModeState()
-        self._detect_expiry_task: Optional[asyncio.Task[None]] = None
 
         self._register_endpoints()
         self._register_events()
-        self._register_static_ui()
 
     def _resolve_data_path(self) -> Path:
         get_app_args = getattr(self.server, "get_app_args", None)
@@ -174,49 +370,12 @@ class KlipperUsbLoad:
 
     def _register_endpoints(self) -> None:
         register_endpoint = getattr(self.server, "register_endpoint", None)
-        if not callable(register_endpoint):
-            return
-
-        register_endpoint(
-            "/server/klipper_usb_load/status",
-            _resolve_request_types(["GET"]),
-            self._handle_get_status,
-        )
-        register_endpoint(
-            "/server/klipper_usb_load/settings",
-            _resolve_request_types(["GET", "POST"]),
-            self._handle_settings,
-        )
-        register_endpoint(
-            "/server/klipper_usb_load/detect-port/start",
-            _resolve_request_types(["POST"]),
-            self._handle_detect_start,
-        )
-        register_endpoint(
-            "/server/klipper_usb_load/detect-port/stop",
-            _resolve_request_types(["POST"]),
-            self._handle_detect_stop,
-        )
-        register_endpoint(
-            "/server/klipper_usb_load/rescan",
-            _resolve_request_types(["POST"]),
-            self._handle_rescan,
-        )
-        register_endpoint(
-            "/server/klipper_usb_load/unmount",
-            _resolve_request_types(["POST"]),
-            self._handle_unmount,
-        )
-        register_endpoint(
-            "/server/klipper_usb_load/print-newest",
-            _resolve_request_types(["POST"]),
-            self._handle_print_newest,
-        )
-        register_endpoint(
-            "/server/klipper_usb_load/udev-event",
-            _resolve_request_types(["POST"]),
-            self._handle_udev_event,
-        )
+        if callable(register_endpoint):
+            register_endpoint(
+                "/server/klipper_usb_load/udev-event",
+                _resolve_request_types(["POST"]),
+                self._handle_udev_event,
+            )
 
     def _register_events(self) -> None:
         register_event = getattr(self.server, "register_event_handler", None)
@@ -224,67 +383,13 @@ class KlipperUsbLoad:
             register_event("file_manager:filelist_changed", self._on_filelist_changed)
             register_event("server:klippy_ready", self._on_klippy_ready)
 
-        register_notif = getattr(self.server, "register_notification", None)
-        if callable(register_notif):
-            register_notif("klipper_usb_load:status_changed")
-
-    def _register_static_ui(self) -> None:
-        if not WEB_DIR.is_dir():
-            return
-        lookup = getattr(self.server, "lookup_component", None)
-        if not callable(lookup):
-            return
-        try:
-            application = lookup("application", None)
-        except TypeError:
-            try:
-                application = lookup("application")
-            except Exception:
-                return
-        except Exception:
-            return
-        if application is None:
-            return
-
-        app = getattr(application, "app", None)
-        add_handlers = getattr(app, "add_handlers", None)
-        if not callable(add_handlers):
-            return
-
-        try:
-            import tornado.web  # type: ignore[import-not-found]
-        except ImportError:
-            return
-
-        class _RedirectUiHandler(tornado.web.RequestHandler):
-            def get(self) -> None:
-                self.redirect("/server/klipper_usb_load/ui/", permanent=False)
-
-        add_handlers(
-            r".*$",
-            [
-                (r"/server/klipper_usb_load/ui", _RedirectUiHandler),
-                (
-                    r"/server/klipper_usb_load/ui/(.*)",
-                    tornado.web.StaticFileHandler,
-                    {"path": str(WEB_DIR), "default_filename": "index.html"},
-                ),
-            ],
-        )
-
     async def component_init(self) -> None:
-        """Moonraker lifecycle hook: prepare auth token and reconcile attached USB drives."""
+        """Moonraker lifecycle hook: prepare udev token and reconcile plugged USB drives."""
         self._ensure_udev_token()
         await self.reconcile_on_startup()
 
     async def close(self) -> None:
-        """Moonraker lifecycle hook: cancel background tasks cleanly."""
-        if self._detect_expiry_task is not None:
-            self._detect_expiry_task.cancel()
-            try:
-                await self._detect_expiry_task
-            except asyncio.CancelledError:
-                pass
+        """Moonraker lifecycle hook: cancel active sync barriers on shutdown."""
         for event in self._port_cancel_events.values():
             event.set()
 
@@ -317,28 +422,12 @@ class KlipperUsbLoad:
 
     async def reconcile_on_startup(self) -> None:
         """Clean stale symlinks and mount any already-connected allowed USB storage drives."""
-        ports = self.topology.scan_ports(
-            settings=self.settings_store.settings,
-            mounted_drives=self._mounted_drives,
-        )
-        connected_allowed_ports = {
-            port.port_id
-            for port in ports
-            if port.connected
-            and port.device_class == "storage"
-            and port.devnode
-            and port.allowed
-        }
-        self.mount_manager.cleanup_stale_links(connected_allowed_ports)
+        connected = scan_connected_storage_ports(self.cfg.sysfs_root)
+        allowed_connected = [item for item in connected if self.cfg.is_port_allowed(item.port_id)]
+        self.mount_manager.cleanup_stale_links({item.port_id for item in allowed_connected})
 
-        for port in ports:
-            if port.port_id in connected_allowed_ports:
-                await self.handle_drive_added(
-                    port_id=port.port_id,
-                    devnode=port.devnode,
-                    fs_label=port.fs_label,
-                    fs_type=port.fs_type,
-                )
+        for item in allowed_connected:
+            await self.handle_drive_added(port_id=item.port_id, devnode=item.devnode)
 
         await self._recalculate_and_publish(notify_msg=None)
 
@@ -359,33 +448,26 @@ class KlipperUsbLoad:
         self._port_cancel_events[port_id] = ev
         return gen, ev
 
-    async def handle_drive_added(
-        self,
-        *,
-        port_id: str,
-        devnode: str,
-        fs_label: str = "",
-        fs_type: str = "",
-    ) -> dict[str, Any]:
-        """Process a newly attached USB storage device."""
+    async def handle_drive_added(self, *, port_id: str, devnode: str) -> dict[str, Any]:
+        """Handle a USB storage insertion or startup discovery."""
         validate_port_id(port_id)
         validate_devnode(devnode)
 
-        if self._detect_mode.active and time.time() <= self._detect_mode.expires_at:
-            self._detect_mode.detected_port_id = port_id
-            self._detect_mode.detected_device = {
-                "port_id": port_id,
-                "devnode": devnode,
-                "fs_label": fs_label,
-                "fs_type": fs_type,
-            }
-            self._emit_status_changed()
-        elif self._detect_mode.active:
-            self._detect_mode.active = False
-
-        if not self.settings_store.is_port_allowed(port_id):
-            LOGGER.info("Ignoring USB drive %s on disallowed port %s", devnode, port_id)
-            self._emit_status_changed()
+        if not self.cfg.is_port_allowed(port_id):
+            LOGGER.info(
+                "Ignored USB drive %s on port %s (not in allowed_ports=%s)",
+                devnode,
+                port_id,
+                list(self.cfg.allowed_ports),
+            )
+            await self.bridge.publish_state(
+                newest_file=self._newest_file,
+                total_count=self._total_file_count(),
+                status_text="",
+                notify_msg=f"USB blocked: {port_id}",
+                lcd_notifications=self.cfg.lcd_notifications,
+                update_macro_state=False,
+            )
             return {"status": "ignored", "reason": "port_not_allowed", "port_id": port_id}
 
         gen, cancel_event = self._bump_generation(port_id)
@@ -393,64 +475,35 @@ class KlipperUsbLoad:
             if self._port_generations.get(port_id) != gen or cancel_event.is_set():
                 return {"status": "cancelled", "port_id": port_id}
 
-            settings = self.settings_store.settings
             mount_point = await self.mount_manager.mount_drive(devnode, port_id)
-
-            scanning_progress = SyncProgress(
-                state="scanning",
-                message=f"Scanning USB ({port_id})...",
-            )
-            drive_state = MountedDriveState(
-                port_id=port_id,
-                devnode=devnode,
-                mount_point=str(mount_point),
-                gcode_subdir=self.mount_manager.port_gcode_rel_dir(port_id),
-                fs_label=fs_label,
-                fs_type=fs_type,
-                files=[],
-                sync_progress=scanning_progress,
-                mounted_at=time.time(),
-            )
-            self._mounted_drives[port_id] = drive_state
-            self._emit_status_changed()
-
             scanned_files = self.mount_manager.scan_mount_for_gcodes(
                 mount_point,
                 port_id,
-                max_depth=settings.max_scan_depth,
-                extensions=settings.gcode_extensions,
+                max_depth=self.cfg.max_scan_depth,
+                extensions=self.cfg.gcode_extensions,
             )
             self.mount_manager.materialize_symlinks(port_id, scanned_files)
 
-            drive_state.files = scanned_files
-            drive_state.sync_progress = SyncProgress(
-                state="syncing" if scanned_files else "ready",
-                total_files=len(scanned_files),
-                seen_files=0,
-                metadata_ready_files=0,
-                missing_files=[f.rel_path for f in scanned_files],
-                message=(
-                    f"USB: Loading 0/{len(scanned_files)}"
-                    if scanned_files
-                    else "USB mounted (no G-code files found)"
-                ),
+            drive = MountedDrive(
+                port_id=port_id,
+                devnode=devnode,
+                gcode_subdir=self.mount_manager.port_gcode_rel_dir(port_id),
+                files=scanned_files,
             )
-            self._emit_status_changed()
+            self._mounted_drives[port_id] = drive
 
             last_lcd_time = 0.0
 
             async def on_progress(progress: SyncProgress) -> None:
                 nonlocal last_lcd_time
-                drive_state.sync_progress = progress
-                self._emit_status_changed()
                 now = time.monotonic()
                 if (
                     progress.state == "syncing"
-                    and settings.lcd_notifications
+                    and self.cfg.lcd_notifications
                     and (now - last_lcd_time >= 1.5)
                 ):
                     last_lcd_time = now
-                    await self.adapter.publish_usb_state(
+                    await self.bridge.publish_state(
                         newest_file=self._newest_file,
                         total_count=self._total_file_count(),
                         status_text=progress.message,
@@ -460,9 +513,9 @@ class KlipperUsbLoad:
 
             sync_result = await self.sync_engine.wait_for_files_loaded(
                 scanned_files,
-                rel_dir=drive_state.gcode_subdir,
-                wait_for_metadata=settings.wait_for_metadata,
-                timeout_seconds=settings.sync_timeout_seconds,
+                rel_dir=drive.gcode_subdir,
+                wait_for_metadata=self.cfg.wait_for_metadata,
+                timeout_seconds=self.cfg.sync_timeout_seconds,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
             )
@@ -470,54 +523,48 @@ class KlipperUsbLoad:
             if sync_result.cancelled or self._port_generations.get(port_id) != gen:
                 return {"status": "cancelled", "port_id": port_id}
 
-            drive_state.sync_progress = sync_result.progress
-            self._ready_paths_by_port[port_id] = set(sync_result.ready_paths)
+            drive.ready_paths = set(sync_result.ready_paths)
             if sync_result.progress.warning:
-                self._last_warning = sync_result.progress.warning
-            else:
-                self._last_warning = ""
+                LOGGER.warning("Port %s: %s", port_id, sync_result.progress.warning)
 
             newest = await self._recalculate_and_publish(
-                notify_msg=self._build_ready_notification(port_id, drive_state)
+                notify_msg=self._ready_notification(port_id, drive, sync_result.progress)
             )
             return {
                 "status": "mounted",
                 "port_id": port_id,
                 "file_count": len(scanned_files),
-                "newest_file": newest.to_dict() if newest else None,
-                "sync_progress": sync_result.progress.to_dict(),
+                "newest_file": newest.rel_path if newest else None,
             }
 
-    async def handle_drive_removed(self, *, port_id: str, force: bool = True) -> dict[str, Any]:
-        """Process physical or manual removal of a USB drive on port_id."""
+    async def handle_drive_removed(self, *, port_id: str) -> dict[str, Any]:
+        """Handle physical removal of a USB drive on port_id."""
         validate_port_id(port_id)
         self._bump_generation(port_id)
 
         async with self._get_port_lock(port_id):
-            removed_drive = self._mounted_drives.pop(port_id, None)
-            self._ready_paths_by_port.pop(port_id, None)
-
-            active_print = await self.adapter.get_active_print_info()
-            in_use = (
-                removed_drive is not None
-                and active_print.is_active
-                and self._is_print_using_drive(active_print, removed_drive)
+            removed = self._mounted_drives.pop(port_id, None)
+            active_filename = await self.bridge.get_active_print_filename()
+            in_use = bool(
+                removed is not None
+                and active_filename is not None
+                and active_filename.lstrip("/").startswith(f"{removed.gcode_subdir.rstrip('/')}/")
             )
 
             try:
-                await self.mount_manager.unmount_drive(port_id, force=force)
+                await self.mount_manager.unmount_drive(port_id, force=True)
             except MountError as err:
                 LOGGER.warning("Unmount cleanup for %s raised: %s", port_id, err)
 
             if in_use:
-                warning = (
-                    f"WARNING: USB drive on port {port_id} was removed while printing "
-                    f"{active_print.filename}!"
+                LOGGER.error(
+                    "USB drive on port %s removed while printing %s!",
+                    port_id,
+                    active_filename,
                 )
-                self._last_warning = warning
                 notify_msg: Optional[str] = f"USB REMOVED MID-PRINT ({port_id})!"
             else:
-                notify_msg = f"USB removed ({port_id})" if removed_drive is not None else None
+                notify_msg = f"USB removed ({port_id})" if removed is not None else None
 
             await self._recalculate_and_publish(notify_msg=notify_msg)
             return {
@@ -533,11 +580,9 @@ class KlipperUsbLoad:
     ) -> Optional[ScannedGcodeFile]:
         all_files: list[ScannedGcodeFile] = []
         available_paths: set[str] = set()
-        for pid, drive in self._mounted_drives.items():
+        for drive in self._mounted_drives.values():
             all_files.extend(drive.files)
-            ready = self._ready_paths_by_port.get(pid)
-            if ready is not None:
-                available_paths |= ready
+            available_paths |= drive.ready_paths
 
         newest = select_newest_file(all_files, available_paths=available_paths)
         self._newest_file = newest
@@ -547,238 +592,39 @@ class KlipperUsbLoad:
             if newest is not None
             else ("USB mounted (no G-code)" if self._mounted_drives else "No USB")
         )
-        await self.adapter.publish_usb_state(
+        await self.bridge.publish_state(
             newest_file=newest,
             total_count=len(all_files),
             status_text=status_text,
             notify_msg=notify_msg,
-            lcd_notifications=self.settings_store.settings.lcd_notifications,
+            lcd_notifications=self.cfg.lcd_notifications,
         )
-        self._emit_status_changed()
         return newest
 
-    def _build_ready_notification(
+    def _ready_notification(
         self,
         port_id: str,
-        drive_state: MountedDriveState,
+        drive: MountedDrive,
+        progress: SyncProgress,
     ) -> str:
-        if drive_state.sync_progress.state == "warning":
-            return f"USB {port_id}: partial load ({len(drive_state.files)} files)"
+        if progress.state == "warning":
+            return f"USB {port_id}: partial ({len(drive.ready_paths)}/{len(drive.files)})"
         if self._newest_file is not None:
             return f"USB Ready: {self._newest_file.display_name}"
         return f"USB Ready ({port_id}): 0 files"
 
     def _total_file_count(self) -> int:
-        return sum(len(d.files) for d in self._mounted_drives.values())
-
-    def _is_print_using_drive(
-        self,
-        active_print: ActivePrintInfo,
-        drive: MountedDriveState,
-    ) -> bool:
-        if not active_print.filename:
-            return False
-        normalized = active_print.filename.lstrip("/")
-        prefix = f"{drive.gcode_subdir.rstrip('/')}/"
-        return normalized.startswith(prefix)
-
-    async def build_status_payload(self) -> dict[str, Any]:
-        """Build the complete JSON status payload for REST and WebSocket consumers."""
-        settings = self.settings_store.settings
-        ports = self.topology.scan_ports(
-            settings=settings,
-            mounted_drives=self._mounted_drives,
-        )
-        active_print = await self.adapter.get_active_print_info()
-
-        if self._detect_mode.active and time.time() > self._detect_mode.expires_at:
-            self._detect_mode.active = False
-
-        drives_payload: list[dict[str, Any]] = []
-        for drive in self._mounted_drives.values():
-            entry = drive.to_dict()
-            entry["in_use_by_print"] = (
-                active_print.is_active and self._is_print_using_drive(active_print, drive)
-            )
-            drives_payload.append(entry)
-
-        return {
-            "settings": settings.to_dict(),
-            "ports": [p.to_dict() for p in ports],
-            "drives": drives_payload,
-            "newest_file": self._newest_file.to_dict() if self._newest_file else None,
-            "active_print": active_print.to_dict(),
-            "detect_mode": self._detect_mode.to_dict(),
-            "warning": self._last_warning,
-            "klipper_macros_loaded": self.adapter.macros_loaded,
-        }
-
-    def _emit_status_changed(self) -> None:
-        send_notif = getattr(self.server, "send_event", None)
-        if callable(send_notif):
-            try:
-                send_notif(
-                    "klipper_usb_load:status_changed",
-                    {
-                        "newest_file": self._newest_file.to_dict() if self._newest_file else None,
-                        "drives": [d.to_dict() for d in self._mounted_drives.values()],
-                        "detect_mode": self._detect_mode.to_dict(),
-                        "warning": self._last_warning,
-                    },
-                )
-            except Exception:
-                pass
+        return sum(len(drive.files) for drive in self._mounted_drives.values())
 
     async def _on_filelist_changed(self, *args: Any, **kwargs: Any) -> None:
         self.sync_engine.notify_filelist_changed()
 
     async def _on_klippy_ready(self, *args: Any, **kwargs: Any) -> None:
-        self.adapter.reset_macro_cache()
+        self.bridge.reset_macro_cache()
         await self._recalculate_and_publish(notify_msg=None)
 
-    async def _handle_get_status(self, web_request: Any) -> dict[str, Any]:
-        return await self.build_status_payload()
-
-    async def _handle_settings(self, web_request: Any) -> dict[str, Any]:
-        action = str(web_request.get_action()).upper() if hasattr(web_request, "get_action") else "GET"
-        if action == "GET":
-            return {"settings": self.settings_store.settings.to_dict()}
-
-        payload = self._extract_args(web_request)
-        try:
-            updated = self.settings_store.update(payload)
-        except SettingsValidationError as err:
-            raise self._http_error(str(err), status_code=400) from err
-
-        self.mount_manager.set_usb_subdir_name(updated.usb_subdir_name)
-        await self._reconcile_settings_change()
-        return await self.build_status_payload()
-
-    async def _reconcile_settings_change(self) -> None:
-        active_print = await self.adapter.get_active_print_info()
-        settings = self.settings_store.settings
-
-        for pid in list(self._mounted_drives.keys()):
-            if not settings.is_port_allowed(pid):
-                drive = self._mounted_drives[pid]
-                if active_print.is_active and self._is_print_using_drive(active_print, drive):
-                    self._last_warning = (
-                        f"Port {pid} removed from allowlist, but left mounted until active "
-                        "print finishes."
-                    )
-                else:
-                    await self.handle_drive_removed(port_id=pid, force=False)
-
-        ports = self.topology.scan_ports(settings=settings, mounted_drives=self._mounted_drives)
-        for port in ports:
-            if (
-                port.connected
-                and port.device_class == "storage"
-                and port.devnode
-                and port.allowed
-                and port.port_id not in self._mounted_drives
-            ):
-                await self.handle_drive_added(
-                    port_id=port.port_id,
-                    devnode=port.devnode,
-                    fs_label=port.fs_label,
-                    fs_type=port.fs_type,
-                )
-
-        self._emit_status_changed()
-
-    async def _handle_detect_start(self, web_request: Any) -> dict[str, Any]:
-        args = self._extract_args(web_request)
-        duration = float(args.get("duration_seconds", 30.0))
-        duration = max(5.0, min(120.0, duration))
-
-        self._detect_mode = DetectModeState(
-            active=True,
-            expires_at=time.time() + duration,
-            detected_port_id=None,
-            detected_device=None,
-        )
-        if self._detect_expiry_task is not None:
-            self._detect_expiry_task.cancel()
-        self._detect_expiry_task = asyncio.create_task(self._expire_detect_mode(duration))
-        self._emit_status_changed()
-        return {"detect_mode": self._detect_mode.to_dict()}
-
-    async def _expire_detect_mode(self, delay: float) -> None:
-        try:
-            await asyncio.sleep(delay)
-            if self._detect_mode.active and time.time() >= self._detect_mode.expires_at:
-                self._detect_mode.active = False
-                self._emit_status_changed()
-        except asyncio.CancelledError:
-            return
-
-    async def _handle_detect_stop(self, web_request: Any) -> dict[str, Any]:
-        if self._detect_expiry_task is not None:
-            self._detect_expiry_task.cancel()
-        self._detect_mode.active = False
-        self._emit_status_changed()
-        return {"detect_mode": self._detect_mode.to_dict()}
-
-    async def _handle_rescan(self, web_request: Any) -> dict[str, Any]:
-        args = self._extract_args(web_request)
-        target_port = args.get("port_id")
-        ports = self.topology.scan_ports(
-            settings=self.settings_store.settings,
-            mounted_drives=self._mounted_drives,
-        )
-        for port in ports:
-            if target_port and port.port_id != target_port:
-                continue
-            if port.connected and port.device_class == "storage" and port.devnode and port.allowed:
-                await self.handle_drive_added(
-                    port_id=port.port_id,
-                    devnode=port.devnode,
-                    fs_label=port.fs_label,
-                    fs_type=port.fs_type,
-                )
-        return await self.build_status_payload()
-
-    async def _handle_unmount(self, web_request: Any) -> dict[str, Any]:
-        args = self._extract_args(web_request)
-        port_id = str(args.get("port_id", "")).strip()
-        if not port_id:
-            raise self._http_error("port_id is required", status_code=400)
-
-        drive = self._mounted_drives.get(port_id)
-        if drive is None:
-            raise self._http_error(f"No mounted USB drive on port {port_id}", status_code=404)
-
-        active_print = await self.adapter.get_active_print_info()
-        if active_print.is_active and self._is_print_using_drive(active_print, drive):
-            raise self._http_error(
-                f"Cannot unmount port {port_id} while actively printing {active_print.filename}",
-                status_code=409,
-            )
-
-        await self.handle_drive_removed(port_id=port_id, force=False)
-        return await self.build_status_payload()
-
-    async def _handle_print_newest(self, web_request: Any) -> dict[str, Any]:
-        active_print = await self.adapter.get_active_print_info()
-        if active_print.is_active:
-            raise self._http_error(
-                f"Printer is busy ({active_print.state}): {active_print.filename}",
-                status_code=409,
-            )
-
-        if self._newest_file is None:
-            raise self._http_error("No ready USB G-code file is available", status_code=409)
-
-        drive = self._mounted_drives.get(self._newest_file.drive_port_id)
-        if drive is not None and drive.sync_progress.state == "syncing":
-            raise self._http_error("USB files are still indexing in Moonraker", status_code=409)
-
-        await self.adapter.start_print(self._newest_file.rel_path)
-        return {"status": "started", "file": self._newest_file.to_dict()}
-
     async def _handle_udev_event(self, web_request: Any) -> dict[str, Any]:
-        args = self._extract_args(web_request)
+        args = web_request.get_args() if hasattr(web_request, "get_args") else dict(web_request)
         expected_token = self._ensure_udev_token()
         provided_token = str(args.get("token", ""))
         if expected_token and not hmac.compare_digest(expected_token, provided_token):
@@ -787,8 +633,6 @@ class KlipperUsbLoad:
         action = str(args.get("action", "")).strip().lower()
         port_id = str(args.get("port_id", "")).strip()
         devnode = str(args.get("devnode", "")).strip()
-        fs_label = str(args.get("fs_label", "")).strip()
-        fs_type = str(args.get("fs_type", "")).strip()
 
         if not port_id:
             raise self._http_error("port_id is required", status_code=400)
@@ -797,31 +641,17 @@ class KlipperUsbLoad:
             if not devnode:
                 raise self._http_error("devnode is required for add event", status_code=400)
             try:
-                return await self.handle_drive_added(
-                    port_id=port_id,
-                    devnode=devnode,
-                    fs_label=fs_label,
-                    fs_type=fs_type,
-                )
+                return await self.handle_drive_added(port_id=port_id, devnode=devnode)
             except MountError as err:
                 raise self._http_error(str(err), status_code=400) from err
 
         if action == "remove":
             try:
-                return await self.handle_drive_removed(port_id=port_id, force=True)
+                return await self.handle_drive_removed(port_id=port_id)
             except MountError as err:
                 raise self._http_error(str(err), status_code=400) from err
 
         raise self._http_error(f"Unsupported udev action: {action!r}", status_code=400)
-
-    def _extract_args(self, web_request: Any) -> dict[str, Any]:
-        if hasattr(web_request, "get_args"):
-            raw = web_request.get_args()
-            if isinstance(raw, dict):
-                return raw
-        if isinstance(web_request, dict):
-            return web_request
-        return {}
 
     def _http_error(self, message: str, status_code: int = 400) -> Exception:
         server_error = getattr(self.server, "error", None)
