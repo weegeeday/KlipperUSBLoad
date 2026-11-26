@@ -8,7 +8,7 @@ PRINTER_DATA_PATH="${HOME}/printer_data"
 SYSTEM_PREFIX=""
 NON_INTERACTIVE=0
 WITH_LCD=0
-WITH_NGINX=0
+WITH_NGINX=1
 
 usage() {
   cat <<EOF
@@ -17,7 +17,8 @@ Usage: ./install.sh [options]
 Options:
   --non-interactive       Do not prompt for confirmation
   --with-lcd              Copy optional klipper_usb_load_lcd.cfg to printer_data/config
-  --with-nginx            Install nginx snippet into /etc/nginx/conf.d/klipper-usb-load.conf
+  --with-nginx            Install Mainsail Nginx integration (enabled by default)
+  --no-nginx              Skip installing Mainsail Nginx integration
   --moonraker-path PATH   Path to Moonraker checkout (default: ~/moonraker)
   --printer-data PATH     Path to printer_data directory (default: ~/printer_data)
   --system-prefix PATH    Install system files under PATH instead of / (for testing)
@@ -38,6 +39,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --with-nginx)
       WITH_NGINX=1
+      shift
+      ;;
+    --no-nginx)
+      WITH_NGINX=0
       shift
       ;;
     --moonraker-path)
@@ -139,7 +144,17 @@ main() {
 
   if [[ "$WITH_NGINX" -eq 1 ]]; then
     local nginx_dst="${SYSTEM_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
-    install_file_priv 0644 "${SCRIPT_DIR}/config/nginx-klipper-usb-load.conf" "$nginx_dst"
+    if [[ -n "$SYSTEM_PREFIX" || -d /etc/nginx/conf.d ]]; then
+      install_file_priv 0644 "${SCRIPT_DIR}/config/nginx-klipper-usb-load.conf" "$nginx_dst"
+      if [[ -z "$SYSTEM_PREFIX" ]] && command -v nginx >/dev/null 2>&1; then
+        if run_priv nginx -t >/dev/null 2>&1; then
+          run_priv systemctl reload nginx || true
+        else
+          echo "Warning: nginx rejected sub_filter config (missing ngx_http_sub_module?); removing snippet." >&2
+          run_priv rm -f "$nginx_dst" || true
+        fi
+      fi
+    fi
   fi
 
   if [[ -z "$SYSTEM_PREFIX" ]]; then
@@ -164,7 +179,8 @@ main() {
     echo "     and [include klipper_usb_load_lcd.cfg] if you have a [display] section"
   fi
   echo "  2. Add [klipper_usb_load] to ${config_dir}/moonraker.conf"
-  echo "  3. Open Settings Page at http://<printer-ip>:7125/server/klipper_usb_load/ui/"
+  echo "  3. Refresh Mainsail to see the USB G-Code Dashboard panel & USB Load sidebar tab"
+  echo "     (Standalone UI also available at http://<printer-ip>:7125/server/klipper_usb_load/ui/)"
 }
 
 main

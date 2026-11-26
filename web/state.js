@@ -195,3 +195,76 @@ export function buildSettingsPayload(draft) {
     lcd_notifications: Boolean(draft.lcd_notifications),
   };
 }
+
+export function shouldActivateMainsailPlugin(pathname = "") {
+  const normalized = String(pathname || "");
+  if (normalized.startsWith("/server/klipper_usb_load/ui")) {
+    return false;
+  }
+  return true;
+}
+
+export function isDashboardRoute(pathname = "", hash = "") {
+  if (String(hash || "") === "#usb-load") {
+    return false;
+  }
+  const cleanPath = String(pathname || "").replace(/\/+$/, "") || "/";
+  return cleanPath === "/" || cleanPath === "/index.html";
+}
+
+export function summarizeDriveStatus(status) {
+  const drives = Array.isArray(status?.drives) ? status.drives : [];
+  if (drives.length === 0) {
+    return {
+      state: "idle",
+      pillLabel: "No USB",
+      pillTone: "muted",
+      badgeText: "",
+      badgeTone: "ready",
+    };
+  }
+
+  const syncingDrive = drives.find((d) => d.sync_progress?.state === "syncing");
+  if (syncingDrive) {
+    const p = syncingDrive.sync_progress || {};
+    const total = Number(p.total_files || 0);
+    const waitMeta = Boolean(status?.settings?.wait_for_metadata);
+    const done = waitMeta ? Number(p.metadata_ready_files || 0) : Number(p.seen_files || 0);
+    return {
+      state: "syncing",
+      pillLabel: `Loading ${done}/${total}`,
+      pillTone: "info",
+      badgeText: `${done}/${total}`,
+      badgeTone: "syncing",
+    };
+  }
+
+  const warningDrive = drives.find((d) => d.sync_progress?.state === "warning");
+  if (warningDrive) {
+    return {
+      state: "warning",
+      pillLabel: "Partial Load",
+      pillTone: "warning",
+      badgeText: "!",
+      badgeTone: "warn",
+    };
+  }
+
+  if (status?.newest_file) {
+    return {
+      state: "ready",
+      pillLabel: "Ready",
+      pillTone: "success",
+      badgeText: String(drives.length),
+      badgeTone: "ready",
+    };
+  }
+
+  return {
+    state: "mounted",
+    pillLabel: "Mounted (0 files)",
+    pillTone: "accent",
+    badgeText: String(drives.length),
+    badgeTone: "ready",
+  };
+}

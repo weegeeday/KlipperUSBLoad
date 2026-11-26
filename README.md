@@ -19,7 +19,7 @@ KlipperUSBLoad fixes this with a two-phase readiness barrier:
 
 ## Features
 
-- **Web Settings Page** served directly by Moonraker at `http://<printer-ip>:7125/server/klipper_usb_load/ui/` (or `/usb-load/` via optional Nginx proxy).
+- **Native Mainsail Integration:** Automatically adds a **USB G-Code** panel to the Mainsail Dashboard and a **USB Load** tab in the Mainsail sidebar (via Nginx `sub_filter`, without modifying `~/mainsail` so Mainsail updates stay clean). Also accessible standalone at `http://<printer-ip>:7125/server/klipper_usb_load/ui/`.
 - **Physical USB Port Allowlist:** Filter by Linux sysfs physical USB port topology (`1-1.2`, `1-1.3`, etc.) so only chosen USB slots auto-mount (while ignoring Klipper MCUs, webcams, or blocked slots).
 - **Interactive "Detect Port" Helper:** Click **Detect Port**, plug a flash drive into the slot you want to configure, give it a custom label, and save it to the allowlist.
 - **Multi-Drive & Active Print Protection:** Supports multiple allowed ports simultaneously, blocks UI unmount while a drive is actively printing, and warns loudly on LCD/UI if a drive is physically pulled mid-print.
@@ -48,7 +48,7 @@ cd KlipperUSBLoad
 
 Options for `./install.sh`:
 - `--with-lcd`: Also copies `klipper_usb_load_lcd.cfg` (for printers with a physical `[display]`).
-- `--with-nginx`: Installs `/etc/nginx/conf.d/klipper-usb-load.conf` for `/usb-load/` reverse proxy.
+- `--no-nginx`: Skip installing the Mainsail Nginx UI integration (`/etc/nginx/conf.d/klipper-usb-load.conf`).
 - `--non-interactive`: Skips prompts (used by Moonraker `update_manager`).
 
 ### 1. Update `~/printer_data/config/printer.cfg`

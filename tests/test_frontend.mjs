@@ -5,9 +5,12 @@ import {
   buildSettingsPayload,
   classifyPortStatus,
   formatSyncSummary,
+  isDashboardRoute,
   parseExtensionsInput,
   resolveApiBase,
+  shouldActivateMainsailPlugin,
   sortPorts,
+  summarizeDriveStatus,
 } from "../web/state.js";
 
 test("resolveApiBase handles moonraker query override and default root path", () => {
@@ -85,4 +88,33 @@ test("parseExtensionsInput and buildSettingsPayload validate inputs", () => {
       gcode_extensions: ".gcode",
     }),
   );
+});
+
+test("Mainsail route guards and drive status summaries work cleanly", () => {
+  assert.equal(shouldActivateMainsailPlugin("/"), true);
+  assert.equal(shouldActivateMainsailPlugin("/files"), true);
+  assert.equal(shouldActivateMainsailPlugin("/server/klipper_usb_load/ui/"), false);
+
+  assert.equal(isDashboardRoute("/", ""), true);
+  assert.equal(isDashboardRoute("/index.html", ""), true);
+  assert.equal(isDashboardRoute("/", "#usb-load"), false);
+  assert.equal(isDashboardRoute("/console", ""), false);
+
+  assert.equal(summarizeDriveStatus({ drives: [] }).state, "idle");
+  const syncing = summarizeDriveStatus({
+    settings: { wait_for_metadata: true },
+    drives: [
+      { sync_progress: { state: "syncing", total_files: 5, seen_files: 4, metadata_ready_files: 2 } },
+    ],
+  });
+  assert.equal(syncing.state, "syncing");
+  assert.equal(syncing.pillLabel, "Loading 2/5");
+  assert.equal(syncing.badgeText, "2/5");
+
+  const ready = summarizeDriveStatus({
+    drives: [{ sync_progress: { state: "ready" } }],
+    newest_file: { display_name: "benchy.gcode" },
+  });
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.pillLabel, "Ready");
 });

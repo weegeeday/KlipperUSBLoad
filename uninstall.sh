@@ -82,6 +82,9 @@ main() {
     if command -v udevadm >/dev/null 2>&1; then
       run_priv udevadm control --reload-rules || true
     fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files nginx.service >/dev/null 2>&1; then
+      run_priv systemctl reload nginx || true
+    fi
     if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files moonraker.service >/dev/null 2>&1; then
       run_priv systemctl restart moonraker || true
     fi

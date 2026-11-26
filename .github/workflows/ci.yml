@@ -69,6 +69,6 @@ jobs:
         with:
           node-version: "20"
       - name: Syntax check frontend ES modules
-        run: node --check web/state.js && node --check web/app.js
+        run: node --check web/state.js && node --check web/app.js && node --check web/mainsail-plugin.js
       - name: Run frontend unit tests
         run: node --test tests/test_frontend.mjs
