@@ -25,6 +25,57 @@ class MoonrakerAdapter:
 
     def __init__(self, server: Any) -> None:
         self.server = server
+        self._macros_checked: bool = False
+        self._has_set_state_macro: bool = True
+        self._has_notify_macro: bool = True
+        self._warned_missing_macros: bool = False
+
+    @property
+    def macros_loaded(self) -> bool:
+        """Return True if Klipper's _USB_LOAD_SET_STATE macro is loaded (or not yet queried)."""
+        return self._has_set_state_macro
+
+    def reset_macro_cache(self) -> None:
+        """Clear cached macro-presence flags (called on Klippy ready/reconnect)."""
+        self._macros_checked = False
+        self._warned_missing_macros = False
+
+    async def check_macros_installed(self, *, force_refresh: bool = False) -> bool:
+        """Query klippy_apis.get_object_list() to verify Klipper macros are loaded."""
+        if self._macros_checked and not force_refresh:
+            return self._has_set_state_macro
+
+        klippy_apis = self._get_component("klippy_apis")
+        if klippy_apis is None:
+            return self._has_set_state_macro
+
+        get_object_list = getattr(klippy_apis, "get_object_list", None)
+        if not callable(get_object_list):
+            # Minimal test doubles without get_object_list assume macros are present
+            self._macros_checked = True
+            self._has_set_state_macro = True
+            self._has_notify_macro = True
+            return True
+
+        try:
+            objects = get_object_list()
+            if inspect.isawaitable(objects):
+                objects = await objects
+            if isinstance(objects, (list, tuple, set)):
+                obj_set = {str(o) for o in objects}
+                self._has_set_state_macro = "gcode_macro _USB_LOAD_SET_STATE" in obj_set
+                self._has_notify_macro = "gcode_macro _USB_LOAD_NOTIFY" in obj_set
+                self._macros_checked = True
+                if not self._has_set_state_macro and not self._warned_missing_macros:
+                    self._warned_missing_macros = True
+                    LOGGER.warning(
+                        "Klipper macros not loaded in printer.cfg. Add "
+                        "[include klipper_usb_load.cfg] and restart Klipper."
+                    )
+        except Exception as err:
+            LOGGER.debug("get_object_list() unavailable: %s", err)
+
+        return self._has_set_state_macro
 
     def _get_component(self, name: str) -> Any:
         try:
@@ -101,15 +152,17 @@ class MoonrakerAdapter:
         return {}
 
     async def is_metadata_ready(self, rel_path: str) -> bool:
-        """Return True if Moonraker has metadata stored for rel_path."""
+        """Return True if Moonraker has metadata stored for rel_path (in-memory only)."""
         file_manager = self._get_component("file_manager")
         if file_manager is None:
             return False
 
         gcode_metadata = getattr(file_manager, "gcode_metadata", None)
         if gcode_metadata is not None:
-            getter = getattr(gcode_metadata, "get", None)
-            if callable(getter):
+            for attr in ("get", "get_metadata"):
+                getter = getattr(gcode_metadata, attr, None)
+                if not callable(getter):
+                    continue
                 try:
                     meta = getter(rel_path)
                     if inspect.isawaitable(meta):
@@ -117,7 +170,7 @@ class MoonrakerAdapter:
                     if isinstance(meta, dict) and bool(meta):
                         return True
                 except Exception:
-                    pass
+                    continue
 
         get_meta = getattr(file_manager, "get_file_metadata", None)
         if callable(get_meta):
@@ -135,16 +188,7 @@ class MoonrakerAdapter:
             except Exception:
                 pass
 
-        listed = await self.list_gcode_files()
-        entry = listed.get(rel_path)
-        if not entry:
-            return False
-        if entry.get("metadata_ready") is True or entry.get("metadata_pulled") is True:
-            return True
-        return any(
-            key in entry
-            for key in ("slicer", "estimated_time", "filament_total", "layer_height", "thumbnails")
-        )
+        return False
 
     async def request_metadata_parse(self, rel_path: str) -> None:
         """Trigger Moonraker metadata parsing for rel_path if the API exposes it."""
@@ -243,6 +287,8 @@ class MoonrakerAdapter:
         lcd_notifications: bool = True,
     ) -> None:
         """Update Klipper _USB_LOAD_STATE macro variables and optionally show LCD message."""
+        await self.check_macros_installed()
+
         if newest_file is not None:
             filename = sanitize_gcode_string(newest_file.rel_path, max_len=240)
             display_name = sanitize_gcode_string(newest_file.display_name, max_len=64)
@@ -253,11 +299,16 @@ class MoonrakerAdapter:
             ready = 0
 
         safe_status = sanitize_gcode_string(status_text, max_len=64)
-        await self.run_gcode(
-            f'_USB_LOAD_SET_STATE FILENAME="{filename}" DISPLAY_NAME="{display_name}" '
-            f'READY={ready} COUNT={int(total_count)} STATUS="{safe_status}"'
-        )
+        if self._has_set_state_macro:
+            await self.run_gcode(
+                f'_USB_LOAD_SET_STATE FILENAME="{filename}" DISPLAY_NAME="{display_name}" '
+                f'READY={ready} COUNT={int(total_count)} STATUS="{safe_status}"'
+            )
+
         if lcd_notifications and notify_msg:
             safe_msg = sanitize_gcode_string(notify_msg, max_len=80)
             if safe_msg:
-                await self.run_gcode(f'_USB_LOAD_NOTIFY MSG="{safe_msg}"')
+                if self._has_notify_macro:
+                    await self.run_gcode(f'_USB_LOAD_NOTIFY MSG="{safe_msg}"')
+                else:
+                    await self.run_gcode(f"M117 {safe_msg}")

@@ -56,6 +56,14 @@ main() {
   local token=""
   if [[ -r "$TOKEN_FILE" ]]; then
     token="$(tr -d '\r\n' < "$TOKEN_FILE")"
+  else
+    local fallback_token
+    for fallback_token in /home/*/printer_data/comms/klipper_usb_load.token; do
+      if [[ -r "$fallback_token" ]]; then
+        token="$(tr -d '\r\n' < "$fallback_token")"
+        break
+      fi
+    done
   fi
 
   local payload

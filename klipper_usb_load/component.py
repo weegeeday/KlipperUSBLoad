@@ -106,6 +106,7 @@ class KlipperUsbLoad:
     ) -> None:
         self.server = config.get_server() if hasattr(config, "get_server") else config["server"]
         data_path = self._resolve_data_path()
+        self._data_path = data_path
 
         default_settings_path = data_path / "config" / "klipper_usb_load.json"
         settings_path_str = _read_config_value(config, "settings_path", None)
@@ -290,24 +291,29 @@ class KlipperUsbLoad:
     def _ensure_udev_token(self) -> str:
         if self._udev_token:
             return self._udev_token
-        try:
-            if self.token_path.exists():
-                existing = self.token_path.read_text(encoding="utf-8").strip()
-                if existing:
-                    self._udev_token = existing
-                    return existing
-            self.token_path.parent.mkdir(parents=True, exist_ok=True)
-            token = secrets.token_hex(24)
-            self.token_path.write_text(token + "\n", encoding="utf-8")
+
+        fallback_path = self._data_path / "comms" / "klipper_usb_load.token"
+        for candidate in (self.token_path, fallback_path):
             try:
-                self.token_path.chmod(0o640)
-            except OSError:
-                pass
-            self._udev_token = token
-            return token
-        except OSError as err:
-            LOGGER.warning("Unable to persist udev token at %s: %s", self.token_path, err)
-            return ""
+                if candidate.exists():
+                    existing = candidate.read_text(encoding="utf-8").strip()
+                    if existing:
+                        self._udev_token = existing
+                        return existing
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                token = secrets.token_hex(24)
+                candidate.write_text(token + "\n", encoding="utf-8")
+                try:
+                    candidate.chmod(0o640)
+                except OSError:
+                    pass
+                self._udev_token = token
+                if candidate != self.token_path:
+                    LOGGER.info("Stored udev token at fallback path %s", candidate)
+                return token
+            except OSError as err:
+                LOGGER.debug("Unable to persist udev token at %s: %s", candidate, err)
+        return ""
 
     async def reconcile_on_startup(self) -> None:
         """Clean stale symlinks and mount any already-connected allowed USB storage drives."""
@@ -604,6 +610,7 @@ class KlipperUsbLoad:
             "active_print": active_print.to_dict(),
             "detect_mode": self._detect_mode.to_dict(),
             "warning": self._last_warning,
+            "klipper_macros_loaded": self.adapter.macros_loaded,
         }
 
     def _emit_status_changed(self) -> None:
@@ -626,6 +633,7 @@ class KlipperUsbLoad:
         self.sync_engine.notify_filelist_changed()
 
     async def _on_klippy_ready(self, *args: Any, **kwargs: Any) -> None:
+        self.adapter.reset_macro_cache()
         await self._recalculate_and_publish(notify_msg=None)
 
     async def _handle_get_status(self, web_request: Any) -> dict[str, Any]:

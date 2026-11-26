@@ -70,7 +70,7 @@ class GcodeSyncEngine:
         rel_dir: str,
         wait_for_metadata: bool = True,
         timeout_seconds: float = 60.0,
-        poll_interval: float = 0.2,
+        poll_interval: float = 0.5,
         on_progress: Optional[ProgressCallback] = None,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> SyncResult:
@@ -95,6 +95,8 @@ class GcodeSyncEngine:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.1, float(timeout_seconds))
+        seen_paths: set[str] = set()
+        ready_paths: set[str] = set()
         nudged_metadata: set[str] = set()
         last_signature: Optional[tuple[str, int, int, int]] = None
 
@@ -116,13 +118,13 @@ class GcodeSyncEngine:
                 )
 
             self._wakeup_event.clear()
-            listed_files = await self._backend.list_gcode_files()
-            seen_paths = {path for path in expected_paths if path in listed_files}
+            if len(seen_paths) < total:
+                listed_files = await self._backend.list_gcode_files()
+                seen_paths = {path for path in expected_paths if path in listed_files}
 
-            ready_paths: set[str] = set()
             if wait_for_metadata:
                 for path in expected_paths:
-                    if path not in seen_paths:
+                    if path not in seen_paths or path in ready_paths:
                         continue
                     if await self._backend.is_metadata_ready(path):
                         ready_paths.add(path)

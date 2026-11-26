@@ -283,3 +283,73 @@ def test_component_startup_allowlist_detect_multidrive_and_print_protection(tmp_
         await comp.close()
 
     asyncio.run(scenario())
+
+
+def test_missing_klipper_macros_skips_macro_calls_and_recovers_on_klippy_ready(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        data_path = tmp_path / "printer_data"
+        gcodes_dir = data_path / "gcodes"
+        gcodes_dir.mkdir(parents=True)
+
+        usb_src = _make_usb_source(tmp_path / "usb_src", {"part.gcode": 1200.0})
+        sysfs = _setup_fake_sysfs(tmp_path, [("1-1.2", "sda1")])
+        file_manager = FakeFileManager(gcodes_dir)
+
+        class MacroAwareKlippy(FakeKlippyApis):
+            def __init__(self) -> None:
+                super().__init__()
+                self.objects = ["print_stats", "idle_timeout"]
+
+            async def get_object_list(self) -> list[str]:
+                return list(self.objects)
+
+        klippy = MacroAwareKlippy()
+        server = FakeServer(data_path, file_manager, klippy)
+        file_manager.server = server
+
+        runner = FakeMountRunner({"/dev/sda1": usb_src})
+        mount_mgr = MountManager(
+            gcodes_dir=gcodes_dir,
+            mount_base=tmp_path / "run",
+            runner=runner,
+            link_fn=_copy_link,
+        )
+
+        # Point token_path at a non-writable/file-blocked location to verify fallback token path
+        blocked_parent = tmp_path / "blocked_file"
+        blocked_parent.write_text("not a dir", encoding="utf-8")
+
+        comp = KlipperUsbLoad(
+            {
+                "server": server,
+                "sysfs_root": str(sysfs),
+                "mount_base": str(tmp_path / "run"),
+                "sync_timeout_seconds": 5.0,
+            },
+            mount_manager=mount_mgr,
+            token_path=blocked_parent / "udev.token",
+        )
+        await comp.component_init()
+
+        fallback_token = data_path / "comms" / "klipper_usb_load.token"
+        assert fallback_token.exists()
+        assert comp._ensure_udev_token() == fallback_token.read_text(encoding="utf-8").strip()
+
+        status = await comp.build_status_payload()
+        assert status["klipper_macros_loaded"] is False
+        assert not any(cmd.startswith("_USB_LOAD_SET_STATE") for cmd in klippy.gcodes_run)
+        assert not any(cmd.startswith("_USB_LOAD_NOTIFY") for cmd in klippy.gcodes_run)
+        assert any(cmd.startswith("M117 ") for cmd in klippy.gcodes_run)
+
+        # Now user adds [include klipper_usb_load.cfg] and Klippy becomes ready
+        klippy.gcodes_run.clear()
+        klippy.objects.extend(["gcode_macro _USB_LOAD_SET_STATE", "gcode_macro _USB_LOAD_NOTIFY"])
+        await server.trigger_event("server:klippy_ready")
+
+        status_after = await comp.build_status_payload()
+        assert status_after["klipper_macros_loaded"] is True
+        assert any(cmd.startswith("_USB_LOAD_SET_STATE") for cmd in klippy.gcodes_run)
+
+        await comp.close()
+
+    asyncio.run(scenario())

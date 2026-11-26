@@ -17,11 +17,13 @@ class SimulatedMoonrakerBackend:
         self.metadata_ready: set[str] = set()
         self.refresh_calls: list[str] = []
         self.parse_requests: list[str] = []
+        self.list_calls: int = 0
 
     async def refresh_directory(self, rel_dir: str) -> None:
         self.refresh_calls.append(rel_dir)
 
     async def list_gcode_files(self) -> dict[str, dict[str, Any]]:
+        self.list_calls += 1
         return dict(self.listed)
 
     async def is_metadata_ready(self, rel_path: str) -> bool:
@@ -194,5 +196,38 @@ def test_empty_drive_completes_immediately() -> None:
         )
         assert result.progress.state == "ready"
         assert result.progress.total_files == 0
+
+    asyncio.run(scenario())
+
+
+def test_list_gcode_files_not_polled_after_all_files_seen() -> None:
+    async def scenario() -> None:
+        backend = SimulatedMoonrakerBackend()
+        engine = GcodeSyncEngine(backend)
+
+        f1 = _make_file("a.gcode", 10.0)
+        f2 = _make_file("b.gcode", 20.0)
+        # All files already in file list on tick 1, but metadata takes several ticks
+        backend.listed[f1.rel_path] = {"size": 100}
+        backend.listed[f2.rel_path] = {"size": 200}
+
+        async def finish_metadata_later() -> None:
+            await asyncio.sleep(0.12)
+            backend.metadata_ready.add(f1.rel_path)
+            backend.metadata_ready.add(f2.rel_path)
+            engine.notify_filelist_changed()
+
+        driver = asyncio.create_task(finish_metadata_later())
+        result = await engine.wait_for_files_loaded(
+            [f1, f2],
+            rel_dir="usb/port_1-1.2",
+            wait_for_metadata=True,
+            timeout_seconds=2.0,
+            poll_interval=0.03,
+        )
+        await driver
+
+        assert result.progress.state == "ready"
+        assert backend.list_calls == 1
 
     asyncio.run(scenario())

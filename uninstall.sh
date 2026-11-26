@@ -65,6 +65,7 @@ main() {
   local helper_dst="${SYSTEM_PREFIX}/usr/local/sbin/klipper-usb-load-helper"
   local notify_dst="${SYSTEM_PREFIX}/usr/local/bin/klipper-usb-load-notify"
   local udev_dst="${SYSTEM_PREFIX}/etc/udev/rules.d/99-klipper-usb-load.rules"
+  local tmpfiles_dst="${SYSTEM_PREFIX}/etc/tmpfiles.d/klipper-usb-load.conf"
   local sudoers_dst="${SYSTEM_PREFIX}/etc/sudoers.d/klipper-usb-load"
   local nginx_dst="${SYSTEM_PREFIX}/etc/nginx/conf.d/klipper-usb-load.conf"
 
@@ -75,7 +76,7 @@ main() {
   rm -f "${MOONRAKER_PATH}/moonraker/components/klipper_usb_load.py"
   rm -rf "${PRINTER_DATA_PATH}/gcodes/usb"
 
-  run_priv rm -f "$helper_dst" "$notify_dst" "$udev_dst" "$sudoers_dst" "$nginx_dst"
+  run_priv rm -f "$helper_dst" "$notify_dst" "$udev_dst" "$tmpfiles_dst" "$sudoers_dst" "$nginx_dst"
 
   if [[ -z "$SYSTEM_PREFIX" ]]; then
     if command -v udevadm >/dev/null 2>&1; then

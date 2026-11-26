@@ -111,15 +111,22 @@ main() {
     install -m 0644 "${SCRIPT_DIR}/config/klipper_usb_load_lcd.cfg" "${config_dir}/klipper_usb_load_lcd.cfg"
   fi
 
-  # 3. Install system mount helper, udev notifier, udev rule, and sudoers
+  # 3. Install system mount helper, udev notifier, udev rule, tmpfiles, and sudoers
   local helper_dst="${SYSTEM_PREFIX}/usr/local/sbin/klipper-usb-load-helper"
   local notify_dst="${SYSTEM_PREFIX}/usr/local/bin/klipper-usb-load-notify"
   local udev_dst="${SYSTEM_PREFIX}/etc/udev/rules.d/99-klipper-usb-load.rules"
+  local tmpfiles_dst="${SYSTEM_PREFIX}/etc/tmpfiles.d/klipper-usb-load.conf"
   local sudoers_dst="${SYSTEM_PREFIX}/etc/sudoers.d/klipper-usb-load"
 
   install_file_priv 0755 "${SCRIPT_DIR}/scripts/klipper-usb-load-helper" "$helper_dst"
   install_file_priv 0755 "${SCRIPT_DIR}/scripts/klipper-usb-load-notify" "$notify_dst"
   install_file_priv 0644 "${SCRIPT_DIR}/scripts/99-klipper-usb-load.rules" "$udev_dst"
+
+  local tmp_tmpfiles
+  tmp_tmpfiles="$(mktemp)"
+  sed "s/@USER@/${TARGET_USER}/g" "${SCRIPT_DIR}/scripts/klipper-usb-load.tmpfiles.template" > "$tmp_tmpfiles"
+  install_file_priv 0644 "$tmp_tmpfiles" "$tmpfiles_dst"
+  rm -f "$tmp_tmpfiles"
 
   local tmp_sudoers
   tmp_sudoers="$(mktemp)"
@@ -136,6 +143,12 @@ main() {
   fi
 
   if [[ -z "$SYSTEM_PREFIX" ]]; then
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+      run_priv systemd-tmpfiles --create /etc/tmpfiles.d/klipper-usb-load.conf || true
+    else
+      run_priv mkdir -p /run/klipper-usb-load
+      run_priv chown "${TARGET_USER}:${TARGET_USER}" /run/klipper-usb-load || true
+    fi
     if command -v udevadm >/dev/null 2>&1; then
       run_priv udevadm control --reload-rules || true
     fi

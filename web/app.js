@@ -105,9 +105,17 @@ function syncFormInputsFromDraft() {
 }
 
 function renderNewestAndDrives(status) {
-  const warning = status.warning || "";
-  if (warning) {
-    els.globalWarning.textContent = warning;
+  const notices = [];
+  if (status.warning) {
+    notices.push(status.warning);
+  }
+  if (status.klipper_macros_loaded === false) {
+    notices.push(
+      "Klipper macros not loaded: add [include klipper_usb_load.cfg] to printer.cfg and restart Klipper to enable PRINT_NEWEST_USB and LCD menu integration.",
+    );
+  }
+  if (notices.length > 0) {
+    els.globalWarning.textContent = notices.join(" • ");
     els.globalWarning.classList.remove("hidden");
   } else {
     els.globalWarning.classList.add("hidden");
