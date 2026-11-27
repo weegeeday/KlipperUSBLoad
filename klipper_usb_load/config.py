@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 _PORT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
 _SUBDIR_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -133,8 +133,8 @@ class UsbLoadConfig:
     usb_subdir_name: str = "usb"
     sysfs_root: Path = Path("/sys")
     mount_base: Path = Path("/run/klipper-usb-load")
-    gcodes_path: Optional[Path] = None
-    udev_token_path: Optional[Path] = None
+    gcodes_path: Path | None = None
+    udev_token_path: Path | None = None
 
     def is_port_allowed(self, port_id: str) -> bool:
         """Return True when allowed_ports is empty (allow all) or contains port_id."""

@@ -3,5 +3,4 @@
 
 ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/local/bin/klipper-usb-load-notify"
 ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="disk", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/local/bin/klipper-usb-load-notify"
-ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", RUN+="/usr/local/bin/klipper-usb-load-notify"
-ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="disk", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/local/bin/klipper-usb-load-notify"
+ACTION=="remove", SUBSYSTEM=="block", KERNEL=="sd[a-z]*", RUN+="/usr/local/bin/klipper-usb-load-notify"

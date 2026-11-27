@@ -157,7 +157,7 @@ main() {
   echo "Next steps:"
   echo "  1. Add to ${config_dir}/printer.cfg:"
   echo "       [include klipper_usb_load.cfg]"
-  echo "       [include klipper_usb_load_lcd.cfg]"
+  echo "       [include klipper_usb_load_lcd.cfg]   # only if you have a [display] section"
   echo "  2. Add [klipper_usb_load] to ${config_dir}/moonraker.conf (see config/moonraker.conf.example)"
   echo "  3. Restart Klipper and Moonraker."
 }

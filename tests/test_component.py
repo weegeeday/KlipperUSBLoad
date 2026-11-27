@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from klipper_usb_load.component import KlipperUsbLoad
+from klipper_usb_load.component import KlipperUsbLoad, MoonrakerBridge
 from klipper_usb_load.usb import UsbMountManager
 
 
@@ -34,8 +34,13 @@ class FakeFileManager:
             for path in target.rglob("*"):
                 if path.is_file():
                     rel = path.relative_to(self.gcodes_dir).as_posix()
-                    self.files[rel] = {"size": path.stat().st_size, "modified": path.stat().st_mtime}
-                    self.gcode_metadata[rel] = {"slicer": "PrusaSlicer", "size": path.stat().st_size}
+                    st = path.stat()
+                    self.files[rel] = {"size": st.st_size, "modified": st.st_mtime}
+                    self.gcode_metadata[rel] = {
+                        "slicer": "PrusaSlicer",
+                        "size": st.st_size,
+                        "modified": st.st_mtime,
+                    }
         if self.server is not None:
             await self.server.trigger_event("file_manager:filelist_changed")
 
@@ -74,7 +79,9 @@ class FakeKlippyApis:
 
 
 class FakeServer:
-    def __init__(self, data_path: Path, file_manager: FakeFileManager, klippy: FakeKlippyApis) -> None:
+    def __init__(
+        self, data_path: Path, file_manager: FakeFileManager, klippy: FakeKlippyApis
+    ) -> None:
         self._data_path = data_path
         self.components: dict[str, Any] = {
             "file_manager": file_manager,
@@ -147,7 +154,7 @@ def _copy_link(src: str, dst: str) -> None:
     os.utime(dst, (st.st_atime, st.st_mtime))
 
 
-def test_startup_allowlist_multidrive_removal_and_token_auth(tmp_path: Path) -> None:
+def test_startup_allowlist_nonblocking_udev_and_ready_notification(tmp_path: Path) -> None:
     async def scenario() -> None:
         data_path = tmp_path / "printer_data"
         gcodes_dir = data_path / "gcodes"
@@ -183,20 +190,23 @@ def test_startup_allowlist_multidrive_removal_and_token_auth(tmp_path: Path) -> 
             mount_manager=mount_mgr,
         )
         await comp.component_init()
+        await comp.wait_pending_tasks()
 
         assert list(server.endpoints.keys()) == ["/server/klipper_usb_load/udev-event"]
         assert not stale.exists()
         assert comp._newest_file is not None
         assert comp._newest_file.rel_path == "usb/port_1-1.2/new1.gcode"
+        assert any('MSG="USB Ready: new1.gcode"' in cmd for cmd in klippy.gcodes_run)
 
         token = comp._ensure_udev_token()
-        # Disallowed port 1-1.4 is ignored and shows LCD hint
-        ignored = await comp._handle_udev_event(
+        # Disallowed port 1-1.4 is accepted asynchronously, ignored, and shows LCD hint
+        accepted = await comp._handle_udev_event(
             FakeWebRequest(
                 {"action": "add", "port_id": "1-1.4", "devnode": "/dev/sdb1", "token": token}
             )
         )
-        assert ignored["status"] == "ignored"
+        assert accepted == {"status": "accepted", "action": "add", "port_id": "1-1.4"}
+        await comp.wait_pending_tasks()
         assert any("USB blocked: 1-1.4" in cmd for cmd in klippy.gcodes_run)
 
         # Invalid token must be rejected
@@ -210,10 +220,11 @@ def test_startup_allowlist_multidrive_removal_and_token_auth(tmp_path: Path) -> 
         # Removal while actively printing triggers urgent LCD warning
         klippy.print_state = "printing"
         klippy.print_filename = "usb/port_1-1.2/new1.gcode"
-        rem = await comp._handle_udev_event(
+        rem_accepted = await comp._handle_udev_event(
             FakeWebRequest({"action": "remove", "port_id": "1-1.2", "token": token})
         )
-        assert rem["active_print_interrupted"] is True
+        assert rem_accepted["status"] == "accepted"
+        await comp.wait_pending_tasks()
         assert any("USB REMOVED MID-PRINT" in cmd for cmd in klippy.gcodes_run)
 
         await comp.close()
@@ -221,7 +232,7 @@ def test_startup_allowlist_multidrive_removal_and_token_auth(tmp_path: Path) -> 
     asyncio.run(scenario())
 
 
-def test_missing_macros_fallback_and_token_fallback(tmp_path: Path) -> None:
+def test_missing_macros_fallback_and_stale_metadata_rejection(tmp_path: Path) -> None:
     async def scenario() -> None:
         data_path = tmp_path / "printer_data"
         gcodes_dir = data_path / "gcodes"
@@ -233,6 +244,16 @@ def test_missing_macros_fallback_and_token_fallback(tmp_path: Path) -> None:
         klippy = FakeKlippyApis(objects=["print_stats"])
         server = FakeServer(data_path, file_manager, klippy)
         file_manager.server = server
+
+        # Verify stale metadata with wrong size is rejected by MoonrakerBridge
+        file_manager.gcode_metadata["usb/port_1-1.1/part.gcode"] = {"size": 999999, "modified": 1.0}
+        bridge = MoonrakerBridge(server)
+        assert (
+            await bridge.is_metadata_ready(
+                "usb/port_1-1.1/part.gcode", expected_size=18, expected_mtime=100.0
+            )
+            is False
+        )
 
         blocked_parent = tmp_path / "not_a_dir"
         blocked_parent.write_text("x", encoding="utf-8")
@@ -254,6 +275,7 @@ def test_missing_macros_fallback_and_token_fallback(tmp_path: Path) -> None:
             mount_manager=mount_mgr,
         )
         await comp.component_init()
+        await comp.wait_pending_tasks()
 
         fallback_token = data_path / "comms" / "klipper_usb_load.token"
         assert fallback_token.exists()

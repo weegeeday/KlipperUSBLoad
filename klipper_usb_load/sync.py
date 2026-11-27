@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal, Optional, Protocol, Sequence
+from typing import Any, Callable, Literal, Protocol
 
 from .usb import ScannedGcodeFile
 
@@ -41,10 +43,16 @@ class MoonrakerFileBackend(Protocol):
     async def refresh_directory(self, rel_dir: str) -> None:
         """Ask Moonraker to scan/refresh a relative directory inside gcodes/."""
 
-    async def list_gcode_files(self) -> dict[str, dict[str, Any]]:
+    async def list_gcode_files(self, rel_dir: str | None = None) -> dict[str, dict[str, Any]]:
         """Return a mapping of POSIX rel_path -> file entry dict."""
 
-    async def is_metadata_ready(self, rel_path: str) -> bool:
+    async def is_metadata_ready(
+        self,
+        rel_path: str,
+        *,
+        expected_size: int | None = None,
+        expected_mtime: float | None = None,
+    ) -> bool:
         """Return True when Moonraker has completed metadata indexing for rel_path."""
 
     async def request_metadata_parse(self, rel_path: str) -> None:
@@ -56,8 +64,8 @@ ProgressCallback = Callable[[SyncProgress], Awaitable[None]]
 
 def select_newest_file(
     files: Sequence[ScannedGcodeFile],
-    available_paths: Optional[set[str]] = None,
-) -> Optional[ScannedGcodeFile]:
+    available_paths: set[str] | None = None,
+) -> ScannedGcodeFile | None:
     """Select the newest G-code file by mtime (deterministic rel_path tie-break)."""
     candidates = list(files)
     if available_paths is not None:
@@ -86,10 +94,11 @@ class GcodeSyncEngine:
         wait_for_metadata: bool = True,
         timeout_seconds: float = 60.0,
         poll_interval: float = 0.5,
-        on_progress: Optional[ProgressCallback] = None,
-        cancel_event: Optional[asyncio.Event] = None,
+        on_progress: ProgressCallback | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> SyncResult:
         """Wait until all expected_files are listed (and metadata-ready if enabled)."""
+        expected_by_path = {item.rel_path: item for item in expected_files}
         expected_paths = [item.rel_path for item in expected_files]
         total = len(expected_paths)
 
@@ -113,7 +122,7 @@ class GcodeSyncEngine:
         seen_paths: set[str] = set()
         ready_paths: set[str] = set()
         nudged_metadata: set[str] = set()
-        last_signature: Optional[tuple[str, int, int, int]] = None
+        last_signature: tuple[str, int, int, int] | None = None
 
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -134,14 +143,19 @@ class GcodeSyncEngine:
 
             self._wakeup_event.clear()
             if len(seen_paths) < total:
-                listed_files = await self._backend.list_gcode_files()
+                listed_files = await self._backend.list_gcode_files(rel_dir=rel_dir)
                 seen_paths = {path for path in expected_paths if path in listed_files}
 
             if wait_for_metadata:
                 for path in expected_paths:
                     if path not in seen_paths or path in ready_paths:
                         continue
-                    if await self._backend.is_metadata_ready(path):
+                    item = expected_by_path[path]
+                    if await self._backend.is_metadata_ready(
+                        path,
+                        expected_size=item.size,
+                        expected_mtime=item.mtime,
+                    ):
                         ready_paths.add(path)
                     elif path not in nudged_metadata:
                         nudged_metadata.add(path)
@@ -213,13 +227,11 @@ class GcodeSyncEngine:
     async def _wait_for_wakeup_or_cancel(
         self,
         timeout: float,
-        cancel_event: Optional[asyncio.Event],
+        cancel_event: asyncio.Event | None,
     ) -> None:
         if cancel_event is None:
-            try:
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._wakeup_event.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                pass
             return
 
         if cancel_event.is_set():
@@ -236,10 +248,8 @@ class GcodeSyncEngine:
             for task in pending:
                 task.cancel()
             for task in pending:
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
         except asyncio.CancelledError:
             wakeup_task.cancel()
             cancel_task.cancel()

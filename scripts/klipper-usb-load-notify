@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 MOONRAKER_URL="${KLIPPER_USB_LOAD_URL:-http://127.0.0.1:7125/server/klipper_usb_load/udev-event}"
 TOKEN_FILE="${KLIPPER_USB_LOAD_TOKEN_FILE:-/run/klipper-usb-load/udev.token}"

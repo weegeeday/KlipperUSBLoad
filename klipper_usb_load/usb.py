@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Optional, Protocol, Sequence
+from typing import Callable, Protocol
 
 _DEVNODE_RE = re.compile(r"^/dev/sd[a-z]+[0-9]*$")
 _PORT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
@@ -80,7 +82,9 @@ class SubprocessMountRunner:
         await self._run(*args)
 
     async def _run(self, *args: str) -> None:
-        cmd = ["sudo", "-n", self.helper_path, *args] if self.use_sudo else [self.helper_path, *args]
+        cmd = (
+            ["sudo", "-n", self.helper_path, *args] if self.use_sudo else [self.helper_path, *args]
+        )
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -120,10 +124,10 @@ def sanitize_port_id(port_id: str) -> str:
     return cleaned
 
 
-def extract_port_id_from_sysfs_path(path_text: str) -> Optional[str]:
+def extract_port_id_from_sysfs_path(path_text: str) -> str | None:
     """Extract the deepest USB port ID segment (e.g. '1-1.3') from a sysfs path."""
     parts = [segment for segment in path_text.replace("\\", "/").split("/") if segment]
-    found: Optional[str] = None
+    found: str | None = None
     for segment in parts:
         if ":" in segment:
             continue
@@ -132,29 +136,21 @@ def extract_port_id_from_sysfs_path(path_text: str) -> Optional[str]:
     return found
 
 
-def _resolve_block_port(block_entry: Path) -> Optional[str]:
+def _resolve_block_port(block_entry: Path) -> str | None:
     candidates: list[str] = []
     marker = block_entry / "device_path"
     if marker.is_file():
-        try:
+        with contextlib.suppress(OSError):
             candidates.append(marker.read_text(encoding="utf-8", errors="replace").strip())
-        except OSError:
-            pass
     if block_entry.is_symlink():
-        try:
+        with contextlib.suppress(OSError):
             candidates.append(os.readlink(block_entry))
-        except OSError:
-            pass
-    try:
+    with contextlib.suppress(OSError):
         candidates.append(str(block_entry.resolve()))
-    except OSError:
-        pass
     device_link = block_entry / "device"
     if device_link.exists() or device_link.is_symlink():
-        try:
+        with contextlib.suppress(OSError):
             candidates.append(str(device_link.resolve()))
-        except OSError:
-            pass
 
     for path_text in candidates:
         port_id = extract_port_id_from_sysfs_path(path_text)
@@ -206,8 +202,8 @@ class UsbMountManager:
         gcodes_dir: Path,
         mount_base: Path = Path("/run/klipper-usb-load"),
         usb_subdir_name: str = "usb",
-        runner: Optional[MountCommandRunner] = None,
-        link_fn: Optional[Callable[[str, str], None]] = None,
+        runner: MountCommandRunner | None = None,
+        link_fn: Callable[[str, str], None] | None = None,
     ) -> None:
         self.gcodes_dir = Path(gcodes_dir)
         self.mount_base = Path(mount_base)

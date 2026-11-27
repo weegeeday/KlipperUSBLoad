@@ -82,13 +82,16 @@ def test_core_klipper_cfg_sections_and_jinja_render() -> None:
         },
     }
 
-    set_out = _render_klipper_template(cfg.get("gcode_macro _USB_LOAD_SET_STATE", "gcode"), base_ctx)
+    set_out = _render_klipper_template(
+        cfg.get("gcode_macro _USB_LOAD_SET_STATE", "gcode"), base_ctx
+    )
     assert """VALUE="'usb/port_1-1.2/benchy.gcode'" """.strip() in set_out
     assert "VALUE=1" in set_out
 
     # Verify SET_GCODE_VARIABLE values pass Klipper's ast.literal_eval after outer-quote stripping
+    long_name = "2mm ID with treads x 16mm_PETG_9m17s.gcode"
     for sample_rel, sample_name in (
-        ("usb/port_1-1.1/2mm ID with treads x 16mm_PETG_9m17s.gcode", "2mm ID with treads x 16mm_PETG_9m17s.gcode"),
+        (f"usb/port_1-1.1/{long_name}", long_name),
         ("usb/port_1-1.1/John's part.gcode", "John's part.gcode"),
     ):
         sample_ctx = {
@@ -106,8 +109,9 @@ def test_core_klipper_cfg_sections_and_jinja_render() -> None:
             sample_ctx,
         )
         parsed_vars: dict[str, Any] = {}
+        pat = r"^\s*SET_GCODE_VARIABLE\s+MACRO=\S+\s+VARIABLE=(\S+)\s+VALUE=(.+)$"
         for line in rendered.splitlines():
-            match = re.match(r"^\s*SET_GCODE_VARIABLE\s+MACRO=\S+\s+VARIABLE=(\S+)\s+VALUE=(.+)$", line)
+            match = re.match(pat, line)
             if not match:
                 continue
             var_name = match.group(1)
@@ -121,7 +125,9 @@ def test_core_klipper_cfg_sections_and_jinja_render() -> None:
         assert parsed_vars["count"] == 5
         assert parsed_vars["status"] == f"Ready: {sample_name}"
 
-    notify_out = _render_klipper_template(cfg.get("gcode_macro _USB_LOAD_NOTIFY", "gcode"), base_ctx)
+    notify_out = _render_klipper_template(
+        cfg.get("gcode_macro _USB_LOAD_NOTIFY", "gcode"), base_ctx
+    )
     assert "M117 USB Ready: benchy.gcode" in notify_out
 
     print_out = _render_klipper_template(cfg.get("gcode_macro PRINT_NEWEST_USB", "gcode"), base_ctx)
@@ -169,3 +175,15 @@ def test_lcd_menu_cfg_expressions() -> None:
         "idle_timeout": {"state": "Printing"},
     }
     assert env.compile_expression(enable_inner)(printer=printing_printer) is False
+
+    paused_printer = {
+        **idle_ready_printer,
+        "print_stats": {"state": "paused"},
+    }
+    assert env.compile_expression(enable_inner)(printer=paused_printer) is False
+
+    with_standby_stats = {
+        **idle_ready_printer,
+        "print_stats": {"state": "standby"},
+    }
+    assert env.compile_expression(enable_inner)(printer=with_standby_stats) is True

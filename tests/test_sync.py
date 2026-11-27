@@ -20,11 +20,17 @@ class SimulatedBackend:
     async def refresh_directory(self, rel_dir: str) -> None:
         self.refresh_calls.append(rel_dir)
 
-    async def list_gcode_files(self) -> dict[str, dict[str, Any]]:
+    async def list_gcode_files(self, rel_dir: str | None = None) -> dict[str, dict[str, Any]]:
         self.list_calls += 1
         return dict(self.listed)
 
-    async def is_metadata_ready(self, rel_path: str) -> bool:
+    async def is_metadata_ready(
+        self,
+        rel_path: str,
+        *,
+        expected_size: int | None = None,
+        expected_mtime: float | None = None,
+    ) -> bool:
         return rel_path in self.metadata_ready
 
     async def request_metadata_parse(self, rel_path: str) -> None:

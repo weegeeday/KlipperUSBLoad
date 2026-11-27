@@ -16,7 +16,7 @@ def _resolve_repo_root() -> Path:
             return candidate
 
     resolved = Path(__file__).resolve()
-    # When symlinked from moonraker/components/klipper_usb_load.py -> <repo>/scripts/moonraker_loader.py
+    # When symlinked from moonraker/components/klipper_usb_load.py
     repo_candidate = resolved.parent.parent
     if (repo_candidate / "klipper_usb_load").is_dir():
         return repo_candidate

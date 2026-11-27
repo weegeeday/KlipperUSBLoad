@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import inspect
 import logging
+import os
 import re
 import secrets
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable
 
 from .config import UsbLoadConfig
 from .sync import GcodeSyncEngine, SyncProgress, select_newest_file
@@ -88,7 +91,7 @@ class MoonrakerBridge:
         self._warned_missing_macros = False
 
     async def refresh_directory(self, rel_dir: str) -> None:
-        """Ask Moonraker file_manager to rescan rel_dir inside gcodes/."""
+        """Ask Moonraker file_manager to rescan rel_dir if supported."""
         file_manager = self._get_component("file_manager")
         if file_manager is None:
             return
@@ -113,11 +116,15 @@ class MoonrakerBridge:
             except Exception as err:
                 LOGGER.debug("Moonraker %s(%s) raised: %s", method_name, rel_dir, err)
 
-    async def list_gcode_files(self) -> dict[str, dict[str, Any]]:
-        """Return Moonraker's current gcodes file mapping (rel_path -> info dict)."""
+    async def list_gcode_files(self, rel_dir: str | None = None) -> dict[str, dict[str, Any]]:
+        """Return Moonraker's gcodes file mapping, scoped to rel_dir when list_dir is available."""
         file_manager = self._get_component("file_manager")
         if file_manager is None:
             return {}
+
+        list_dir = getattr(file_manager, "list_dir", None)
+        if callable(list_dir) and rel_dir:
+            return self._list_dir_recursive(list_dir, rel_dir.strip("/"))
 
         get_file_list = getattr(file_manager, "get_file_list", None)
         if not callable(get_file_list):
@@ -139,20 +146,65 @@ class MoonrakerBridge:
             return {str(k): (v if isinstance(v, dict) else {}) for k, v in raw.items()}
         if isinstance(raw, list):
             return {
-                str(item["path"]): item
-                for item in raw
-                if isinstance(item, dict) and "path" in item
+                str(item["path"]): item for item in raw if isinstance(item, dict) and "path" in item
             }
         return {}
 
-    async def is_metadata_ready(self, rel_path: str) -> bool:
-        """Return True if Moonraker has metadata stored in memory for rel_path."""
+    def _list_dir_recursive(self, list_dir: Any, root_rel_dir: str) -> dict[str, dict[str, Any]]:
+        collected: dict[str, dict[str, Any]] = {}
+        queue = [root_rel_dir]
+        visited: set[str] = set()
+
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            try:
+                listing = list_dir(f"gcodes/{current}")
+            except Exception:
+                continue
+            if not isinstance(listing, dict):
+                continue
+
+            for file_entry in listing.get("files", []):
+                if not isinstance(file_entry, dict):
+                    continue
+                fname = str(file_entry.get("filename", ""))
+                if fname:
+                    collected[f"{current}/{fname}"] = file_entry
+
+            for dir_entry in listing.get("dirs", []):
+                if not isinstance(dir_entry, dict):
+                    continue
+                dname = str(dir_entry.get("dirname", ""))
+                if dname:
+                    queue.append(f"{current}/{dname}")
+
+        return collected
+
+    async def is_metadata_ready(
+        self,
+        rel_path: str,
+        *,
+        expected_size: int | None = None,
+        expected_mtime: float | None = None,
+    ) -> bool:
+        """Return True when Moonraker has valid, non-pending metadata in memory."""
         file_manager = self._get_component("file_manager")
         if file_manager is None:
             return False
 
         gcode_metadata = getattr(file_manager, "gcode_metadata", None)
         if gcode_metadata is not None:
+            is_processing = getattr(gcode_metadata, "is_file_processing", None)
+            if callable(is_processing):
+                try:
+                    if bool(is_processing(rel_path)):
+                        return False
+                except Exception:
+                    pass
+
             for attr in ("get", "get_metadata"):
                 getter = getattr(gcode_metadata, attr, None)
                 if not callable(getter):
@@ -161,7 +213,9 @@ class MoonrakerBridge:
                     meta = getter(rel_path)
                     if inspect.isawaitable(meta):
                         meta = await meta
-                    if isinstance(meta, dict) and bool(meta):
+                    if isinstance(meta, dict) and self._metadata_matches(
+                        meta, expected_size=expected_size, expected_mtime=expected_mtime
+                    ):
                         return True
                 except Exception:
                     continue
@@ -172,11 +226,8 @@ class MoonrakerBridge:
                 meta = get_meta(rel_path)
                 if inspect.isawaitable(meta):
                     meta = await meta
-                if isinstance(meta, dict) and (
-                    "slicer" in meta
-                    or "estimated_time" in meta
-                    or "metadata_pulled" in meta
-                    or "size" in meta
+                if isinstance(meta, dict) and self._metadata_matches(
+                    meta, expected_size=expected_size, expected_mtime=expected_mtime
                 ):
                     return True
             except Exception:
@@ -184,8 +235,31 @@ class MoonrakerBridge:
 
         return False
 
+    def _metadata_matches(
+        self,
+        meta: dict[str, Any],
+        *,
+        expected_size: int | None,
+        expected_mtime: float | None,
+    ) -> bool:
+        if not meta:
+            return False
+        if expected_size is not None and "size" in meta:
+            try:
+                if int(meta["size"]) != int(expected_size):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if expected_mtime is not None and "modified" in meta:
+            try:
+                if abs(float(meta["modified"]) - float(expected_mtime)) > 2.0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
     async def request_metadata_parse(self, rel_path: str) -> None:
-        """Trigger Moonraker metadata parsing for rel_path if exposed."""
+        """Trigger Moonraker metadata parsing for rel_path with real path_info."""
         file_manager = self._get_component("file_manager")
         if file_manager is None:
             return
@@ -193,12 +267,26 @@ class MoonrakerBridge:
         if gcode_metadata is None:
             return
 
+        path_info: dict[str, Any] = {}
+        get_dir = getattr(file_manager, "get_directory", None)
+        get_path_info = getattr(file_manager, "get_path_info", None)
+        if callable(get_dir) and callable(get_path_info):
+            try:
+                gcodes_root = str(get_dir("gcodes"))
+                full_path = os.path.join(gcodes_root, rel_path)
+                info = get_path_info(full_path, "gcodes", raise_error=False)
+                if isinstance(info, dict):
+                    path_info = info
+            except Exception:
+                path_info = {}
+
         for method_name in ("parse_metadata", "add_file"):
             method = getattr(gcode_metadata, method_name, None)
             if not callable(method):
                 continue
             try:
-                result = method(rel_path, {})
+                result = method(rel_path, path_info)
+                # parse_metadata returns an asyncio.Event (not a coroutine) in Moonraker
                 if inspect.isawaitable(result):
                     await result
                 return
@@ -249,7 +337,7 @@ class MoonrakerBridge:
 
         return self._has_set_state_macro
 
-    async def get_active_print_filename(self) -> Optional[str]:
+    async def get_active_print_filename(self) -> str | None:
         """Return the filename being printed/paused in Klipper, or None if idle."""
         klippy_apis = self._get_component("klippy_apis")
         if klippy_apis is None:
@@ -273,8 +361,8 @@ class MoonrakerBridge:
             LOGGER.debug("Could not query Klipper print_stats: %s", err)
         return None
 
-    async def run_gcode(self, script: str) -> None:
-        """Execute a G-code script on Klipper via klippy_apis."""
+    async def run_gcode(self, script: str, *, timeout: float = 3.0) -> None:
+        """Execute a G-code script on Klipper via klippy_apis with a bounded wait."""
         klippy_apis = self._get_component("klippy_apis")
         if klippy_apis is None:
             return
@@ -284,17 +372,19 @@ class MoonrakerBridge:
         try:
             result = run_gcode(script)
             if inspect.isawaitable(result):
-                await result
+                await asyncio.wait_for(result, timeout=timeout)
+        except asyncio.TimeoutError:
+            LOGGER.debug("run_gcode(%s) timed out after %.1fs (printer busy)", script, timeout)
         except Exception as err:
             LOGGER.debug("run_gcode(%s) failed: %s", script, err)
 
     async def publish_state(
         self,
         *,
-        newest_file: Optional[ScannedGcodeFile],
+        newest_file: ScannedGcodeFile | None,
         total_count: int,
         status_text: str,
-        notify_msg: Optional[str] = None,
+        notify_msg: str | None = None,
         lcd_notifications: bool = True,
         update_macro_state: bool = True,
     ) -> None:
@@ -332,8 +422,8 @@ class KlipperUsbLoad:
         self,
         config: Any,
         *,
-        mount_manager: Optional[UsbMountManager] = None,
-        bridge: Optional[MoonrakerBridge] = None,
+        mount_manager: UsbMountManager | None = None,
+        bridge: MoonrakerBridge | None = None,
     ) -> None:
         self.server = config.get_server() if hasattr(config, "get_server") else config["server"]
         self.cfg = UsbLoadConfig.from_moonraker_config(config)
@@ -355,7 +445,8 @@ class KlipperUsbLoad:
         self._port_locks: dict[str, asyncio.Lock] = {}
         self._port_cancel_events: dict[str, asyncio.Event] = {}
         self._port_generations: dict[str, int] = {}
-        self._newest_file: Optional[ScannedGcodeFile] = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._newest_file: ScannedGcodeFile | None = None
 
         self._register_endpoints()
         self._register_events()
@@ -381,17 +472,43 @@ class KlipperUsbLoad:
         register_event = getattr(self.server, "register_event_handler", None)
         if callable(register_event):
             register_event("file_manager:filelist_changed", self._on_filelist_changed)
+            register_event("file_manager:metadata_processed", self._on_metadata_processed)
             register_event("server:klippy_ready", self._on_klippy_ready)
 
+    def _spawn_background_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                LOGGER.exception("Background task failed", exc_info=exc)
+
+        task.add_done_callback(_on_done)
+        return task
+
+    async def wait_pending_tasks(self) -> None:
+        """Await all currently scheduled background tasks (primarily for tests)."""
+        while self._background_tasks:
+            pending = list(self._background_tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
+
     async def component_init(self) -> None:
-        """Moonraker lifecycle hook: prepare udev token and reconcile plugged USB drives."""
+        """Moonraker lifecycle hook: prepare udev token and reconcile USB drives in background."""
         self._ensure_udev_token()
-        await self.reconcile_on_startup()
+        self._spawn_background_task(self.reconcile_on_startup())
 
     async def close(self) -> None:
-        """Moonraker lifecycle hook: cancel active sync barriers on shutdown."""
+        """Moonraker lifecycle hook: cancel active sync barriers and background tasks."""
         for event in self._port_cancel_events.values():
             event.set()
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
 
     def _ensure_udev_token(self) -> str:
         if self._udev_token:
@@ -408,10 +525,8 @@ class KlipperUsbLoad:
                 candidate.parent.mkdir(parents=True, exist_ok=True)
                 token = secrets.token_hex(24)
                 candidate.write_text(token + "\n", encoding="utf-8")
-                try:
+                with contextlib.suppress(OSError):
                     candidate.chmod(0o640)
-                except OSError:
-                    pass
                 self._udev_token = token
                 if candidate != self.token_path:
                     LOGGER.info("Stored udev token at fallback path %s", candidate)
@@ -528,7 +643,9 @@ class KlipperUsbLoad:
                 LOGGER.warning("Port %s: %s", port_id, sync_result.progress.warning)
 
             newest = await self._recalculate_and_publish(
-                notify_msg=self._ready_notification(port_id, drive, sync_result.progress)
+                notify_builder=lambda newest_file: self._ready_notification(
+                    port_id, drive, sync_result.progress, newest_file
+                )
             )
             return {
                 "status": "mounted",
@@ -562,7 +679,7 @@ class KlipperUsbLoad:
                     port_id,
                     active_filename,
                 )
-                notify_msg: Optional[str] = f"USB REMOVED MID-PRINT ({port_id})!"
+                notify_msg: str | None = f"USB REMOVED MID-PRINT ({port_id})!"
             else:
                 notify_msg = f"USB removed ({port_id})" if removed is not None else None
 
@@ -576,8 +693,9 @@ class KlipperUsbLoad:
     async def _recalculate_and_publish(
         self,
         *,
-        notify_msg: Optional[str],
-    ) -> Optional[ScannedGcodeFile]:
+        notify_msg: str | None = None,
+        notify_builder: Callable[[ScannedGcodeFile | None], str] | None = None,
+    ) -> ScannedGcodeFile | None:
         all_files: list[ScannedGcodeFile] = []
         available_paths: set[str] = set()
         for drive in self._mounted_drives.values():
@@ -587,6 +705,7 @@ class KlipperUsbLoad:
         newest = select_newest_file(all_files, available_paths=available_paths)
         self._newest_file = newest
 
+        resolved_notify = notify_builder(newest) if notify_builder is not None else notify_msg
         status_text = (
             f"Ready: {newest.display_name}"
             if newest is not None
@@ -596,7 +715,7 @@ class KlipperUsbLoad:
             newest_file=newest,
             total_count=len(all_files),
             status_text=status_text,
-            notify_msg=notify_msg,
+            notify_msg=resolved_notify,
             lcd_notifications=self.cfg.lcd_notifications,
         )
         return newest
@@ -606,17 +725,21 @@ class KlipperUsbLoad:
         port_id: str,
         drive: MountedDrive,
         progress: SyncProgress,
+        newest: ScannedGcodeFile | None,
     ) -> str:
         if progress.state == "warning":
             return f"USB {port_id}: partial ({len(drive.ready_paths)}/{len(drive.files)})"
-        if self._newest_file is not None:
-            return f"USB Ready: {self._newest_file.display_name}"
+        if newest is not None:
+            return f"USB Ready: {newest.display_name}"
         return f"USB Ready ({port_id}): 0 files"
 
     def _total_file_count(self) -> int:
         return sum(len(drive.files) for drive in self._mounted_drives.values())
 
     async def _on_filelist_changed(self, *args: Any, **kwargs: Any) -> None:
+        self.sync_engine.notify_filelist_changed()
+
+    async def _on_metadata_processed(self, *args: Any, **kwargs: Any) -> None:
         self.sync_engine.notify_filelist_changed()
 
     async def _on_klippy_ready(self, *args: Any, **kwargs: Any) -> None:
@@ -637,19 +760,22 @@ class KlipperUsbLoad:
         if not port_id:
             raise self._http_error("port_id is required", status_code=400)
 
-        if action == "add":
-            if not devnode:
-                raise self._http_error("devnode is required for add event", status_code=400)
-            try:
-                return await self.handle_drive_added(port_id=port_id, devnode=devnode)
-            except MountError as err:
-                raise self._http_error(str(err), status_code=400) from err
+        try:
+            validate_port_id(port_id)
+            if action == "add":
+                if not devnode:
+                    raise self._http_error("devnode is required for add event", status_code=400)
+                validate_devnode(devnode)
+                self._spawn_background_task(
+                    self.handle_drive_added(port_id=port_id, devnode=devnode)
+                )
+                return {"status": "accepted", "action": action, "port_id": port_id}
 
-        if action == "remove":
-            try:
-                return await self.handle_drive_removed(port_id=port_id)
-            except MountError as err:
-                raise self._http_error(str(err), status_code=400) from err
+            if action == "remove":
+                self._spawn_background_task(self.handle_drive_removed(port_id=port_id))
+                return {"status": "accepted", "action": action, "port_id": port_id}
+        except MountError as err:
+            raise self._http_error(str(err), status_code=400) from err
 
         raise self._http_error(f"Unsupported udev action: {action!r}", status_code=400)
 
@@ -662,9 +788,15 @@ class KlipperUsbLoad:
 
             return ServerError(message, status_code)  # type: ignore[no-any-return]
         except ImportError:
-            err = RuntimeError(message)
-            setattr(err, "status_code", status_code)
-            return err
+            return _LocalHttpError(message, status_code)
+
+
+class _LocalHttpError(RuntimeError):
+    """Fallback HTTP error used in standalone unit tests without Moonraker."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def load_component(config: Any) -> KlipperUsbLoad:

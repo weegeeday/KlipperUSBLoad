@@ -25,10 +25,9 @@ git clone https://github.com/weegeeday/KlipperUSBLoad.git ~/KlipperUSBLoad && ~/
 
 ```ini
 [include klipper_usb_load.cfg]
+# Include klipper_usb_load_lcd.cfg only if your printer has a [display] section:
 [include klipper_usb_load_lcd.cfg]
 ```
-
-*(Omit `klipper_usb_load_lcd.cfg` if your printer does not have a Klipper `[display]` section — you can still trigger `PRINT_NEWEST_USB`.)*
 
 ### 2. Configure `[klipper_usb_load]` in `~/printer_data/config/moonraker.conf`
 
