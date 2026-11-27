@@ -179,6 +179,12 @@ def _decode_udev_label(raw_name: str) -> str:
     return re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), raw_name).strip()
 
 
+def _default_by_label_dir(sysfs_root: Path) -> Path:
+    if Path(sysfs_root) == Path("/sys"):
+        return Path("/dev/disk/by-label")
+    return Path(sysfs_root).parent / "dev" / "disk" / "by-label"
+
+
 def resolve_volume_label(
     devnode: str,
     by_label_dir: Path = Path("/dev/disk/by-label"),
@@ -212,13 +218,16 @@ def resolve_usb_display_name(
     fs_label: str = "",
     devnode: str = "",
     sysfs_root: Path = Path("/sys"),
-    by_label_dir: Path = Path("/dev/disk/by-label"),
+    by_label_dir: Path | None = None,
 ) -> str:
     """Resolve the best human-friendly name: volume label -> USB product -> port_id."""
     cleaned_label = fs_label.strip()
     if cleaned_label:
         return cleaned_label
-    vol_label = resolve_volume_label(devnode, by_label_dir=by_label_dir)
+    effective_by_label = (
+        by_label_dir if by_label_dir is not None else _default_by_label_dir(sysfs_root)
+    )
+    vol_label = resolve_volume_label(devnode, by_label_dir=effective_by_label)
     if vol_label:
         return vol_label
     product = read_usb_product_name(sysfs_root, port_id)
@@ -247,7 +256,7 @@ def sanitize_drive_folder_name(
 
 def scan_connected_storage_ports(
     sysfs_root: Path = Path("/sys"),
-    by_label_dir: Path = Path("/dev/disk/by-label"),
+    by_label_dir: Path | None = None,
 ) -> list[ConnectedUsbStorage]:
     """Return connected USB block storage devices mapped to their physical USB port ID."""
     block_dir = Path(sysfs_root) / "class" / "block"

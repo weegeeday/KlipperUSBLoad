@@ -10,6 +10,7 @@ import pytest
 from klipper_usb_load.usb import (
     MountError,
     UsbMountManager,
+    _decode_udev_label,
     extract_port_id_from_sysfs_path,
     resolve_usb_display_name,
     sanitize_drive_folder_name,
@@ -129,10 +130,30 @@ def test_resolve_usb_display_name_and_folder_sanitization(tmp_path: Path) -> Non
     dev_dir.mkdir(parents=True)
     (dev_dir / "product").write_text("SanDisk Ultra Fit", encoding="utf-8")
 
-    # Priority: fs_label -> sysfs product -> port_id
+    # Priority: fs_label -> by-label -> sysfs product -> port_id
     assert resolve_usb_display_name("1-1.2", fs_label="PRUSA USB", sysfs_root=sysfs) == "PRUSA USB"
     assert resolve_usb_display_name("1-1.2", sysfs_root=sysfs) == "SanDisk Ultra Fit"
+    # Custom sysfs_root must not leak the host's /dev/disk/by-label for /dev/sda1
+    assert (
+        resolve_usb_display_name("1-1.2", devnode="/dev/sda1", sysfs_root=sysfs)
+        == "SanDisk Ultra Fit"
+    )
     assert resolve_usb_display_name("1-1.9", sysfs_root=sysfs) == "1-1.9"
+    assert _decode_udev_label(r"MY\x20USB") == "MY USB"
+
+    fake_dev = tmp_path / "dev" / "sda1"
+    fake_dev.parent.mkdir(parents=True)
+    fake_dev.write_text("", encoding="utf-8")
+    by_label = tmp_path / "dev" / "disk" / "by-label"
+    by_label.mkdir(parents=True)
+    try:
+        (by_label / r"MY\x20USB").symlink_to(fake_dev)
+    except OSError:
+        pass
+    else:
+        assert (
+            resolve_usb_display_name("1-1.2", devnode=str(fake_dev), sysfs_root=sysfs) == "MY USB"
+        )
 
     assert sanitize_drive_folder_name("PRUSA USB", "1-1.2") == "PRUSA_USB"
     assert sanitize_drive_folder_name("PRUSA USB", "1-1.4", {"PRUSA_USB"}) == "PRUSA_USB_1-1.4"
