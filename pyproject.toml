@@ -7,7 +7,7 @@ name = "klipper-usb-load"
 version = "0.1.0"
 description = "Moonraker/Klipper plugin for USB G-code auto-mounting, port filtering, and full-indexing readiness verification"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = []
 
@@ -23,7 +23,7 @@ dev = [
 include = ["klipper_usb_load*"]
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
