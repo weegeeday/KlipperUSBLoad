@@ -129,13 +129,16 @@ def _setup_sysfs(tmp_path: Path, ports: list[tuple[str, str]]) -> Path:
     sysfs = tmp_path / "sys"
     blk_dir = sysfs / "class" / "block"
     blk_dir.mkdir(parents=True)
-    for port_id, dev_name in ports:
+    for idx, (port_id, dev_name) in enumerate(ports, start=1):
         blk = blk_dir / dev_name
         blk.mkdir()
         (blk / "device_path").write_text(
             f"/sys/devices/usb1/{port_id}/{port_id}:1.0/block/{dev_name}",
             encoding="utf-8",
         )
+        usb_dev = sysfs / "bus" / "usb" / "devices" / port_id
+        usb_dev.mkdir(parents=True, exist_ok=True)
+        (usb_dev / "product").write_text(f"USB_STICK_{idx}", encoding="utf-8")
     return sysfs
 
 
@@ -195,19 +198,25 @@ def test_startup_allowlist_nonblocking_udev_and_ready_notification(tmp_path: Pat
         assert list(server.endpoints.keys()) == ["/server/klipper_usb_load/udev-event"]
         assert not stale.exists()
         assert comp._newest_file is not None
-        assert comp._newest_file.rel_path == "usb/port_1-1.2/new1.gcode"
+        assert comp._newest_file.rel_path == "usb/USB_STICK_1/new1.gcode"
         assert any('MSG="USB Ready: new1.gcode"' in cmd for cmd in klippy.gcodes_run)
 
         token = comp._ensure_udev_token()
-        # Disallowed port 1-1.4 is accepted asynchronously, ignored, and shows LCD hint
+        # Disallowed port 1-1.4 is accepted asynchronously, ignored, and shows USB name + port ID
         accepted = await comp._handle_udev_event(
             FakeWebRequest(
-                {"action": "add", "port_id": "1-1.4", "devnode": "/dev/sdb1", "token": token}
+                {
+                    "action": "add",
+                    "port_id": "1-1.4",
+                    "devnode": "/dev/sdb1",
+                    "fs_label": "BLOCKED_STICK",
+                    "token": token,
+                }
             )
         )
         assert accepted == {"status": "accepted", "action": "add", "port_id": "1-1.4"}
         await comp.wait_pending_tasks()
-        assert any("USB blocked: 1-1.4" in cmd for cmd in klippy.gcodes_run)
+        assert any("BLOCKED_STICK blocked (1-1.4)" in cmd for cmd in klippy.gcodes_run)
 
         # Invalid token must be rejected
         with pytest.raises(RuntimeError):
@@ -217,15 +226,15 @@ def test_startup_allowlist_nonblocking_udev_and_ready_notification(tmp_path: Pat
                 )
             )
 
-        # Removal while actively printing triggers urgent LCD warning
+        # Removal while actively printing triggers urgent LCD warning with USB name
         klippy.print_state = "printing"
-        klippy.print_filename = "usb/port_1-1.2/new1.gcode"
+        klippy.print_filename = "usb/USB_STICK_1/new1.gcode"
         rem_accepted = await comp._handle_udev_event(
             FakeWebRequest({"action": "remove", "port_id": "1-1.2", "token": token})
         )
         assert rem_accepted["status"] == "accepted"
         await comp.wait_pending_tasks()
-        assert any("USB REMOVED MID-PRINT" in cmd for cmd in klippy.gcodes_run)
+        assert any("USB REMOVED MID-PRINT (USB_STICK_1)!" in cmd for cmd in klippy.gcodes_run)
 
         await comp.close()
 

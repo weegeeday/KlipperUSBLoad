@@ -7,7 +7,7 @@ A lean Klipper/Moonraker plugin that brings plug-in-and-print USB flash drive su
 ## How It Works
 
 1. **Read-Only Auto-Mount:** Plugging a USB drive into an allowed physical USB port mounts it read-only (`ro,nosuid,nodev,noexec`) without copying files onto your Pi's SD card.
-2. **Per-Port Symlinks:** Scans up to `max_scan_depth` folders (ignoring hidden files, `._*` macOS AppleDouble files, and 0-byte files) and links them into `~/printer_data/gcodes/usb/port_<port_id>/`.
+2. **Per-Drive Symlinks:** Scans up to `max_scan_depth` folders (ignoring hidden files, `._*` macOS AppleDouble files, and 0-byte files) and links them into `~/printer_data/gcodes/usb/<usb_name>/` (using the drive's volume label or USB product name).
 3. **Full-Load Readiness Barrier:** Triggers a Moonraker directory refresh and waits until **100% of scanned USB files** appear in Moonraker's file list **and** (when `wait_for_metadata: True`) finish metadata parsing — displaying `USB: Loading X/Y` on the LCD.
 4. **LCD Quick-Print:** Once fully loaded, picks the true newest file by modification timestamp, shows `USB Ready: <filename>` on the LCD, and enables the **`USB: <filename>`** entry at the top of the Klipper LCD menu (when idle).
 

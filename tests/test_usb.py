@@ -11,6 +11,8 @@ from klipper_usb_load.usb import (
     MountError,
     UsbMountManager,
     extract_port_id_from_sysfs_path,
+    resolve_usb_display_name,
+    sanitize_drive_folder_name,
     scan_connected_storage_ports,
     validate_devnode,
     validate_port_id,
@@ -109,3 +111,29 @@ def test_scan_mount_filters_junk_respects_depth_and_materializes(tmp_path: Path)
     stale.mkdir(parents=True)
     assert manager.cleanup_stale_links({"1-1.2"}) == ["port_9-9.9"]
     assert not stale.exists()
+
+    # Labeled folders carry the marker file so stale cleanup removes them too
+    labeled_dir = manager.materialize_symlinks("1-1.2", [], folder_name="PRUSA_USB")
+    assert labeled_dir == gcodes_dir / "usb" / "PRUSA_USB"
+    assert (labeled_dir / ".klipper_usb_load").is_file()
+    user_folder = gcodes_dir / "usb" / "my_manual_folder"
+    user_folder.mkdir()
+    assert sorted(manager.cleanup_stale_links(set())) == ["PRUSA_USB", "port_1-1.2"]
+    assert not labeled_dir.exists()
+    assert user_folder.exists()
+
+
+def test_resolve_usb_display_name_and_folder_sanitization(tmp_path: Path) -> None:
+    sysfs = tmp_path / "sys"
+    dev_dir = sysfs / "bus" / "usb" / "devices" / "1-1.2"
+    dev_dir.mkdir(parents=True)
+    (dev_dir / "product").write_text("SanDisk Ultra Fit", encoding="utf-8")
+
+    # Priority: fs_label -> sysfs product -> port_id
+    assert resolve_usb_display_name("1-1.2", fs_label="PRUSA USB", sysfs_root=sysfs) == "PRUSA USB"
+    assert resolve_usb_display_name("1-1.2", sysfs_root=sysfs) == "SanDisk Ultra Fit"
+    assert resolve_usb_display_name("1-1.9", sysfs_root=sysfs) == "1-1.9"
+
+    assert sanitize_drive_folder_name("PRUSA USB", "1-1.2") == "PRUSA_USB"
+    assert sanitize_drive_folder_name("PRUSA USB", "1-1.4", {"PRUSA_USB"}) == "PRUSA_USB_1-1.4"
+    assert sanitize_drive_folder_name("...", "1-1.2") == "port_1-1.2"

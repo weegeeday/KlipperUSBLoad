@@ -11,10 +11,10 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .config import UsbLoadConfig
 from .sync import GcodeSyncEngine, SyncProgress, select_newest_file
@@ -22,6 +22,8 @@ from .usb import (
     MountError,
     ScannedGcodeFile,
     UsbMountManager,
+    resolve_usb_display_name,
+    sanitize_drive_folder_name,
     scan_connected_storage_ports,
     validate_devnode,
     validate_port_id,
@@ -60,6 +62,8 @@ class MountedDrive:
     port_id: str
     devnode: str
     gcode_subdir: str
+    display_name: str = ""
+    folder_name: str = ""
     files: list[ScannedGcodeFile] = field(default_factory=list)
     ready_paths: set[str] = field(default_factory=set)
 
@@ -539,10 +543,14 @@ class KlipperUsbLoad:
         """Clean stale symlinks and mount any already-connected allowed USB storage drives."""
         connected = scan_connected_storage_ports(self.cfg.sysfs_root)
         allowed_connected = [item for item in connected if self.cfg.is_port_allowed(item.port_id)]
-        self.mount_manager.cleanup_stale_links({item.port_id for item in allowed_connected})
+        self.mount_manager.cleanup_stale_links(set())
 
         for item in allowed_connected:
-            await self.handle_drive_added(port_id=item.port_id, devnode=item.devnode)
+            await self.handle_drive_added(
+                port_id=item.port_id,
+                devnode=item.devnode,
+                fs_label=item.display_name,
+            )
 
         await self._recalculate_and_publish(notify_msg=None)
 
@@ -563,23 +571,41 @@ class KlipperUsbLoad:
         self._port_cancel_events[port_id] = ev
         return gen, ev
 
-    async def handle_drive_added(self, *, port_id: str, devnode: str) -> dict[str, Any]:
+    async def handle_drive_added(
+        self,
+        *,
+        port_id: str,
+        devnode: str,
+        fs_label: str = "",
+    ) -> dict[str, Any]:
         """Handle a USB storage insertion or startup discovery."""
         validate_port_id(port_id)
         validate_devnode(devnode)
+        drive_name = resolve_usb_display_name(
+            port_id,
+            fs_label=fs_label,
+            devnode=devnode,
+            sysfs_root=self.cfg.sysfs_root,
+        )
 
         if not self.cfg.is_port_allowed(port_id):
             LOGGER.info(
-                "Ignored USB drive %s on port %s (not in allowed_ports=%s)",
+                "Ignored USB drive %s (%s) on port %s (not in allowed_ports=%s)",
+                drive_name,
                 devnode,
                 port_id,
                 list(self.cfg.allowed_ports),
+            )
+            blocked_msg = (
+                f"{drive_name} blocked ({port_id})"
+                if drive_name != port_id
+                else f"USB blocked: {port_id}"
             )
             await self.bridge.publish_state(
                 newest_file=self._newest_file,
                 total_count=self._total_file_count(),
                 status_text="",
-                notify_msg=f"USB blocked: {port_id}",
+                notify_msg=blocked_msg,
                 lcd_notifications=self.cfg.lcd_notifications,
                 update_macro_state=False,
             )
@@ -590,19 +616,35 @@ class KlipperUsbLoad:
             if self._port_generations.get(port_id) != gen or cancel_event.is_set():
                 return {"status": "cancelled", "port_id": port_id}
 
+            other_folders = {
+                d.folder_name
+                for pid, d in self._mounted_drives.items()
+                if pid != port_id and d.folder_name
+            }
+            folder_name = sanitize_drive_folder_name(
+                drive_name,
+                port_id,
+                existing_folders=other_folders,
+            )
+
             mount_point = await self.mount_manager.mount_drive(devnode, port_id)
             scanned_files = self.mount_manager.scan_mount_for_gcodes(
                 mount_point,
                 port_id,
+                folder_name=folder_name,
                 max_depth=self.cfg.max_scan_depth,
                 extensions=self.cfg.gcode_extensions,
             )
-            self.mount_manager.materialize_symlinks(port_id, scanned_files)
+            self.mount_manager.materialize_symlinks(port_id, scanned_files, folder_name=folder_name)
 
             drive = MountedDrive(
                 port_id=port_id,
                 devnode=devnode,
-                gcode_subdir=self.mount_manager.port_gcode_rel_dir(port_id),
+                gcode_subdir=self.mount_manager.port_gcode_rel_dir(
+                    port_id, folder_name=folder_name
+                ),
+                display_name=drive_name,
+                folder_name=folder_name,
                 files=scanned_files,
             )
             self._mounted_drives[port_id] = drive
@@ -668,20 +710,26 @@ class KlipperUsbLoad:
                 and active_filename.lstrip("/").startswith(f"{removed.gcode_subdir.rstrip('/')}/")
             )
 
+            drive_label = removed.display_name if removed and removed.display_name else port_id
             try:
-                await self.mount_manager.unmount_drive(port_id, force=True)
+                await self.mount_manager.unmount_drive(
+                    port_id,
+                    folder_name=removed.folder_name if removed else None,
+                    force=True,
+                )
             except MountError as err:
                 LOGGER.warning("Unmount cleanup for %s raised: %s", port_id, err)
 
             if in_use:
                 LOGGER.error(
-                    "USB drive on port %s removed while printing %s!",
+                    "USB drive %s on port %s removed while printing %s!",
+                    drive_label,
                     port_id,
                     active_filename,
                 )
-                notify_msg: str | None = f"USB REMOVED MID-PRINT ({port_id})!"
+                notify_msg: str | None = f"USB REMOVED MID-PRINT ({drive_label})!"
             else:
-                notify_msg = f"USB removed ({port_id})" if removed is not None else None
+                notify_msg = f"USB removed ({drive_label})" if removed is not None else None
 
             await self._recalculate_and_publish(notify_msg=notify_msg)
             return {
@@ -727,11 +775,12 @@ class KlipperUsbLoad:
         progress: SyncProgress,
         newest: ScannedGcodeFile | None,
     ) -> str:
+        drive_label = drive.display_name or port_id
         if progress.state == "warning":
-            return f"USB {port_id}: partial ({len(drive.ready_paths)}/{len(drive.files)})"
+            return f"{drive_label}: partial ({len(drive.ready_paths)}/{len(drive.files)})"
         if newest is not None:
             return f"USB Ready: {newest.display_name}"
-        return f"USB Ready ({port_id}): 0 files"
+        return f"{drive_label}: 0 files"
 
     def _total_file_count(self) -> int:
         return sum(len(drive.files) for drive in self._mounted_drives.values())
@@ -756,6 +805,7 @@ class KlipperUsbLoad:
         action = str(args.get("action", "")).strip().lower()
         port_id = str(args.get("port_id", "")).strip()
         devnode = str(args.get("devnode", "")).strip()
+        fs_label = str(args.get("fs_label", "")).strip()
 
         if not port_id:
             raise self._http_error("port_id is required", status_code=400)
@@ -767,7 +817,11 @@ class KlipperUsbLoad:
                     raise self._http_error("devnode is required for add event", status_code=400)
                 validate_devnode(devnode)
                 self._spawn_background_task(
-                    self.handle_drive_added(port_id=port_id, devnode=devnode)
+                    self.handle_drive_added(
+                        port_id=port_id,
+                        devnode=devnode,
+                        fs_label=fs_label,
+                    )
                 )
                 return {"status": "accepted", "action": action, "port_id": port_id}
 
